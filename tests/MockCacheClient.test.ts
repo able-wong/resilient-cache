@@ -295,4 +295,114 @@ describe('MockCacheClient', () => {
       await expect(client.disconnect()).resolves.toBeUndefined();
     });
   });
+
+  describe('exists', () => {
+    it('should return true for existing key', async () => {
+      await client.set('key', 'value');
+      const result = await client.exists('key');
+      expect(result).toBe(true);
+    });
+
+    it('should return false for non-existent key', async () => {
+      const result = await client.exists('missing');
+      expect(result).toBe(false);
+    });
+
+    it('should return false for expired key', async () => {
+      vi.useFakeTimers();
+      await client.set('key', 'value', 1);
+      vi.advanceTimersByTime(1500);
+      const result = await client.exists('key');
+      expect(result).toBe(false);
+    });
+
+    it('should return false when simulating failure (graceful mode)', async () => {
+      client.setSimulateFailure(true);
+      const result = await client.exists('key');
+      expect(result).toBe(false);
+    });
+
+    it('should throw when simulating failure (throw mode)', async () => {
+      const throwClient = new MockCacheClient({ onError: 'throw' });
+      throwClient.setSimulateFailure(true);
+      await expect(throwClient.exists('key')).rejects.toThrow(
+        CacheUnavailableError,
+      );
+    });
+  });
+
+  describe('ttl', () => {
+    it('should return TTL for key with expiry', async () => {
+      vi.useFakeTimers();
+      await client.set('key', 'value', 60);
+      const result = await client.ttl('key');
+      expect(result).toBe(60);
+    });
+
+    it('should return -1 for key without TTL', async () => {
+      await client.set('key', 'value');
+      const result = await client.ttl('key');
+      expect(result).toBe(-1);
+    });
+
+    it('should return -2 for non-existent key', async () => {
+      const result = await client.ttl('missing');
+      expect(result).toBe(-2);
+    });
+
+    it('should return -2 for expired key', async () => {
+      vi.useFakeTimers();
+      await client.set('key', 'value', 1);
+      vi.advanceTimersByTime(1500);
+      const result = await client.ttl('key');
+      expect(result).toBe(-2);
+    });
+
+    it('should return -2 when simulating failure (graceful mode)', async () => {
+      client.setSimulateFailure(true);
+      const result = await client.ttl('key');
+      expect(result).toBe(-2);
+    });
+  });
+
+  describe('getOrSet', () => {
+    it('should return cached value on cache hit', async () => {
+      await client.set('key', 'cached-value');
+      const factory = vi.fn().mockResolvedValue('new-value');
+      const result = await client.getOrSet('key', factory);
+      expect(result).toBe('cached-value');
+      expect(factory).not.toHaveBeenCalled();
+    });
+
+    it('should call factory and cache on cache miss', async () => {
+      const factory = vi.fn().mockResolvedValue('new-value');
+      const result = await client.getOrSet('missing', factory);
+      expect(result).toBe('new-value');
+      expect(factory).toHaveBeenCalledOnce();
+      expect(await client.get('missing')).toBe('new-value');
+    });
+
+    it('should respect TTL parameter', async () => {
+      vi.useFakeTimers();
+      const factory = vi.fn().mockResolvedValue('value');
+      await client.getOrSet('key', factory, 60);
+      const ttl = await client.ttl('key');
+      expect(ttl).toBe(60);
+    });
+
+    it('should call factory when simulating failure (graceful mode)', async () => {
+      client.setSimulateFailure(true);
+      const factory = vi.fn().mockResolvedValue('fallback-value');
+      const result = await client.getOrSet('key', factory);
+      expect(result).toBe('fallback-value');
+      expect(factory).toHaveBeenCalledOnce();
+    });
+
+    it('should propagate factory exceptions', async () => {
+      const factory = vi.fn().mockRejectedValue(new Error('Factory failed'));
+      await expect(client.getOrSet('key', factory)).rejects.toThrow(
+        'Factory failed',
+      );
+    });
+  });
 });

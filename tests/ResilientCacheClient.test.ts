@@ -17,6 +17,8 @@ vi.mock('ioredis', () => {
     incrby: vi.fn().mockResolvedValue(1),
     decrby: vi.fn().mockResolvedValue(1),
     eval: vi.fn().mockResolvedValue(30),
+    exists: vi.fn().mockResolvedValue(1),
+    ttl: vi.fn().mockResolvedValue(60),
     on: vi.fn(),
     removeAllListeners: vi.fn(),
   };
@@ -96,15 +98,20 @@ describe('ResilientCacheClient', () => {
       expect(result).toBe(true);
     });
 
-    it('should return false when not connected (graceful mode)', async () => {
-      const result = await client.ping();
+    it('should return false when not connected (graceful mode, autoConnect disabled)', async () => {
+      const noAutoClient = new ResilientCacheClient({
+        ...defaultOptions,
+        autoConnect: false,
+      });
+      const result = await noAutoClient.ping();
       expect(result).toBe(false);
     });
 
-    it('should throw when not connected (throw mode)', async () => {
+    it('should throw when not connected (throw mode, autoConnect disabled)', async () => {
       const throwClient = new ResilientCacheClient({
         ...defaultOptions,
         onError: 'throw',
+        autoConnect: false,
       });
 
       await expect(throwClient.ping()).rejects.toThrow(CacheUnavailableError);
@@ -118,8 +125,12 @@ describe('ResilientCacheClient', () => {
       expect(result).toBeNull();
     });
 
-    it('should return default value when not connected', async () => {
-      const result = await client.get('key', 'default');
+    it('should return default value when not connected (autoConnect disabled)', async () => {
+      const noAutoClient = new ResilientCacheClient({
+        ...defaultOptions,
+        autoConnect: false,
+      });
+      const result = await noAutoClient.get('key', 'default');
       expect(result).toBe('default');
     });
   });
@@ -131,8 +142,12 @@ describe('ResilientCacheClient', () => {
       expect(result).toBe(true);
     });
 
-    it('should return false when not connected', async () => {
-      const result = await client.set('key', 'value');
+    it('should return false when not connected (autoConnect disabled)', async () => {
+      const noAutoClient = new ResilientCacheClient({
+        ...defaultOptions,
+        autoConnect: false,
+      });
+      const result = await noAutoClient.set('key', 'value');
       expect(result).toBe(false);
     });
   });
@@ -144,15 +159,23 @@ describe('ResilientCacheClient', () => {
       expect(result).toBe(true);
     });
 
-    it('should return false when not connected', async () => {
-      const result = await client.remove('key');
+    it('should return false when not connected (autoConnect disabled)', async () => {
+      const noAutoClient = new ResilientCacheClient({
+        ...defaultOptions,
+        autoConnect: false,
+      });
+      const result = await noAutoClient.remove('key');
       expect(result).toBe(false);
     });
   });
 
   describe('removeByPrefix', () => {
-    it('should return -1 when not connected', async () => {
-      const result = await client.removeByPrefix('prefix:');
+    it('should return -1 when not connected (autoConnect disabled)', async () => {
+      const noAutoClient = new ResilientCacheClient({
+        ...defaultOptions,
+        autoConnect: false,
+      });
+      const result = await noAutoClient.removeByPrefix('prefix:');
       expect(result).toBe(-1);
     });
   });
@@ -172,8 +195,12 @@ describe('ResilientCacheClient', () => {
       expect(result).toBe(1);
     });
 
-    it('should return default when not connected', async () => {
-      const result = await client.increment('counter', 1, 100);
+    it('should return default when not connected (autoConnect disabled)', async () => {
+      const noAutoClient = new ResilientCacheClient({
+        ...defaultOptions,
+        autoConnect: false,
+      });
+      const result = await noAutoClient.increment('counter', 1, 100);
       expect(result).toBe(100);
     });
   });
@@ -193,8 +220,12 @@ describe('ResilientCacheClient', () => {
       expect(result).toBe(30);
     });
 
-    it('should return default when not connected', async () => {
-      const result = await client.decrementOrInit('ratelimit', 30, 60);
+    it('should return default when not connected (autoConnect disabled)', async () => {
+      const noAutoClient = new ResilientCacheClient({
+        ...defaultOptions,
+        autoConnect: false,
+      });
+      const result = await noAutoClient.decrementOrInit('ratelimit', 30, 60);
       expect(result).toBe(30);
     });
   });
@@ -223,10 +254,11 @@ describe('ResilientCacheClient', () => {
   });
 
   describe('per-call options', () => {
-    it('should override default error handling for single call', async () => {
+    it('should override default error handling for single call (autoConnect disabled)', async () => {
       const gracefulClient = new ResilientCacheClient({
         ...defaultOptions,
         onError: 'graceful',
+        autoConnect: false,
       });
 
       await expect(gracefulClient.ping({ onError: 'throw' })).rejects.toThrow(
@@ -234,14 +266,138 @@ describe('ResilientCacheClient', () => {
       );
     });
 
-    it('should use graceful when overriding throw client', async () => {
+    it('should use graceful when overriding throw client (autoConnect disabled)', async () => {
       const throwClient = new ResilientCacheClient({
         ...defaultOptions,
         onError: 'throw',
+        autoConnect: false,
       });
 
       const result = await throwClient.ping({ onError: 'graceful' });
       expect(result).toBe(false);
+    });
+  });
+
+  describe('auto-connect', () => {
+    it('should auto-connect on first command when autoConnect is true (default)', async () => {
+      // client has autoConnect: true by default
+      await client.ping();
+      expect(client.getStatus().state).toBe('connected');
+    });
+
+    it('should not auto-connect when autoConnect is false', async () => {
+      const noAutoClient = new ResilientCacheClient({
+        ...defaultOptions,
+        autoConnect: false,
+      });
+      const result = await noAutoClient.get('key', 'default');
+      expect(result).toBe('default');
+      expect(noAutoClient.getStatus().state).toBe('disconnected');
+    });
+
+    it('should track lastSuccessAt on successful operations', async () => {
+      await client.connect();
+      const beforeOp = new Date();
+      await client.ping();
+      const status = client.getStatus();
+      expect(status.lastSuccessAt).toBeInstanceOf(Date);
+      expect(status.lastSuccessAt!.getTime()).toBeGreaterThanOrEqual(
+        beforeOp.getTime(),
+      );
+    });
+
+    it('should set lastSuccessAt on connection', async () => {
+      await client.connect();
+      const status = client.getStatus();
+      expect(status.lastSuccessAt).toBeInstanceOf(Date);
+      expect(status.lastConnectedAt).toBeInstanceOf(Date);
+    });
+  });
+
+  describe('exists', () => {
+    it('should return true for existing key', async () => {
+      const Redis = (await import('ioredis')).default;
+      const mockInstance = new Redis();
+      (mockInstance.exists as ReturnType<typeof vi.fn>).mockResolvedValue(1);
+
+      await client.connect();
+      const result = await client.exists('key');
+      expect(result).toBe(true);
+    });
+
+    it('should return false when not connected (autoConnect disabled)', async () => {
+      const noAutoClient = new ResilientCacheClient({
+        ...defaultOptions,
+        autoConnect: false,
+      });
+      const result = await noAutoClient.exists('key');
+      expect(result).toBe(false);
+    });
+  });
+
+  describe('ttl', () => {
+    it('should return TTL value', async () => {
+      const Redis = (await import('ioredis')).default;
+      const mockInstance = new Redis();
+      (
+        mockInstance.ttl as unknown as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(60);
+
+      await client.connect();
+      const result = await client.ttl('key');
+      expect(result).toBe(60);
+    });
+
+    it('should return -2 when not connected (autoConnect disabled)', async () => {
+      const noAutoClient = new ResilientCacheClient({
+        ...defaultOptions,
+        autoConnect: false,
+      });
+      const result = await noAutoClient.ttl('key');
+      expect(result).toBe(-2);
+    });
+  });
+
+  describe('getOrSet', () => {
+    it('should return cached value on hit', async () => {
+      const Redis = (await import('ioredis')).default;
+      const mockInstance = new Redis();
+      (mockInstance.get as ReturnType<typeof vi.fn>).mockResolvedValue(
+        JSON.stringify('cached-value'),
+      );
+
+      await client.connect();
+      const factory = vi.fn().mockResolvedValue('new-value');
+      const result = await client.getOrSet('key', factory);
+
+      expect(result).toBe('cached-value');
+      expect(factory).not.toHaveBeenCalled();
+    });
+
+    it('should call factory and cache on miss', async () => {
+      const Redis = (await import('ioredis')).default;
+      const mockInstance = new Redis();
+      (mockInstance.get as ReturnType<typeof vi.fn>).mockResolvedValue(null);
+
+      await client.connect();
+      const factory = vi.fn().mockResolvedValue('new-value');
+      const result = await client.getOrSet('key', factory, 60);
+
+      expect(result).toBe('new-value');
+      expect(factory).toHaveBeenCalledOnce();
+      expect(mockInstance.set).toHaveBeenCalled();
+    });
+
+    it('should call factory when not connected (autoConnect disabled)', async () => {
+      const noAutoClient = new ResilientCacheClient({
+        ...defaultOptions,
+        autoConnect: false,
+      });
+      const factory = vi.fn().mockResolvedValue('fallback-value');
+      const result = await noAutoClient.getOrSet('key', factory);
+
+      expect(result).toBe('fallback-value');
+      expect(factory).toHaveBeenCalledOnce();
     });
   });
 });

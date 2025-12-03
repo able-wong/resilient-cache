@@ -65,10 +65,10 @@ export class ResilientCacheClient implements ICacheClient {
   private state: ConnectionState = 'disconnected';
   private lastError?: Error;
   private lastConnectedAt?: Date;
+  private lastSuccessAt?: Date;
   private lastFailedAt?: Date;
   private reconnectAttempts = 0;
   private cooldownEndsAt?: Date;
-  private cooldownTimer?: ReturnType<typeof setTimeout>;
   private connectPromise: Promise<void> | null = null;
 
   private readonly stateChangeCallbacks: StateChangeCallback[] = [];
@@ -98,6 +98,7 @@ export class ResilientCacheClient implements ICacheClient {
     maxReconnectAttempts: number;
     enableOfflineQueue: boolean;
     onError: 'graceful' | 'throw';
+    autoConnect: boolean;
   };
 
   constructor(options: CacheClientOptions) {
@@ -111,6 +112,7 @@ export class ResilientCacheClient implements ICacheClient {
       maxReconnectAttempts: options.maxReconnectAttempts ?? Infinity,
       enableOfflineQueue: options.enableOfflineQueue ?? false,
       onError: options.onError ?? 'graceful',
+      autoConnect: options.autoConnect ?? true,
     };
   }
 
@@ -162,6 +164,7 @@ export class ResilientCacheClient implements ICacheClient {
       await this.redis.connect();
       this.setState('connected');
       this.lastConnectedAt = new Date();
+      this.lastSuccessAt = new Date();
       this.reconnectAttempts = 0;
     } catch (error) {
       this.handleConnectionFailure(error as Error);
@@ -202,6 +205,7 @@ export class ResilientCacheClient implements ICacheClient {
       state: this.state,
       lastError: this.lastError,
       lastConnectedAt: this.lastConnectedAt,
+      lastSuccessAt: this.lastSuccessAt,
       lastFailedAt: this.lastFailedAt,
       reconnectAttempts: this.reconnectAttempts,
       cooldownEndsAt: this.cooldownEndsAt,
@@ -397,6 +401,60 @@ export class ResilientCacheClient implements ICacheClient {
   }
 
   /**
+   * Get a value from cache, or set it using a factory function if not found
+   * Implements the cache-aside pattern
+   */
+  async getOrSet<T>(
+    key: string,
+    factory: () => Promise<T>,
+    ttlSeconds?: number,
+    options?: CallOptions,
+  ): Promise<T> {
+    this.validateKey(key);
+    if (ttlSeconds !== undefined) {
+      this.validateTtl(ttlSeconds);
+    }
+
+    // Try to get from cache first
+    const cached = await this.get<T>(key, undefined, options);
+    if (cached !== null) {
+      return cached;
+    }
+
+    // Cache miss or unavailable - call factory
+    const value = await factory();
+
+    // Try to cache the result (best effort, ignore failures)
+    await this.set(key, value, ttlSeconds, { onError: 'graceful' });
+
+    return value;
+  }
+
+  /**
+   * Check if a key exists in cache
+   */
+  async exists(key: string, options?: CallOptions): Promise<boolean> {
+    this.validateKey(key);
+    return this.executeCommand('exists', false, options, async () => {
+      const result = await this.redis!.exists(key);
+      return result === 1;
+    });
+  }
+
+  /**
+   * Get the remaining TTL of a key in seconds
+   * Returns -1 if key exists but has no TTL
+   * Returns -2 if key doesn't exist (or cache unavailable in graceful mode)
+   */
+  async ttl(key: string, options?: CallOptions): Promise<number> {
+    this.validateKey(key);
+    return this.executeCommand('ttl', -2, options, async () => {
+      const result = await this.redis!.ttl(key);
+      return result;
+    });
+  }
+
+  /**
    * Register a callback for connection state changes
    */
   onStateChange(callback: StateChangeCallback): void {
@@ -421,22 +479,26 @@ export class ResilientCacheClient implements ICacheClient {
   ): Promise<T> {
     const onError = options?.onError ?? this.options.onError;
 
-    // Check if we can execute commands
+    // Try to ensure connection (handles auto-connect)
     if (!this.canExecuteCommands()) {
-      if (onError === 'throw') {
-        throw new CacheUnavailableError(
-          `Cache is unavailable (state: ${this.state})`,
-          this.lastError,
-          operation,
-        );
+      const connected = await this.ensureConnected();
+      if (!connected) {
+        if (onError === 'throw') {
+          throw new CacheUnavailableError(
+            `Cache is unavailable (state: ${this.state})`,
+            this.lastError,
+            operation,
+          );
+        }
+        return defaultValue;
       }
-      return defaultValue;
     }
 
     const timeout = this.createTimeoutWithCleanup<T>(operation);
     try {
       // Wrap command with timeout
       const result = await Promise.race([command(), timeout.promise]);
+      this.lastSuccessAt = new Date();
       return result as T;
     } catch (error) {
       this.handleCommandError(error as Error, operation);
@@ -455,6 +517,56 @@ export class ResilientCacheClient implements ICacheClient {
     } finally {
       timeout.cleanup();
     }
+  }
+
+  /**
+   * Ensure connection is established (for auto-connect feature)
+   * Respects circuit breaker - fails fast during cooldown, reconnects after cooldown expires
+   */
+  private async ensureConnected(): Promise<boolean> {
+    // Already connected and ready
+    if (this.canExecuteCommands()) {
+      return true;
+    }
+
+    // Auto-connect disabled - don't attempt connection
+    if (!this.options.autoConnect) {
+      return false;
+    }
+
+    // During cooldown - check if cooldown has expired
+    if (this.state === 'cooldown') {
+      if (this.cooldownEndsAt && Date.now() >= this.cooldownEndsAt.getTime()) {
+        // Cooldown expired - attempt reconnect
+        return this.attemptReconnect();
+      }
+      // Still in cooldown - fail fast (circuit breaker open)
+      return false;
+    }
+
+    // In failed state - reset and retry
+    if (this.state === 'failed') {
+      this.reconnectAttempts = 0;
+      return this.attemptReconnect();
+    }
+
+    // Disconnected - try to connect
+    if (this.state === 'disconnected') {
+      try {
+        await this.connect();
+        return this.canExecuteCommands();
+      } catch {
+        return false;
+      }
+    }
+
+    // Connecting or reconnecting - fail fast, don't block
+    // First request triggers connection, others get graceful defaults until connected
+    if (this.state === 'connecting' || this.state === 'reconnecting') {
+      return false;
+    }
+
+    return false;
   }
 
   /**
@@ -621,33 +733,26 @@ export class ResilientCacheClient implements ICacheClient {
   }
 
   /**
-   * Enter cooldown state
+   * Enter cooldown state (command-driven, no timer)
+   * Next command after cooldown expires will trigger reconnect
    */
   private enterCooldown(): void {
     this.setState('cooldown');
     this.cooldownEndsAt = new Date(Date.now() + this.options.reconnectDelay);
-
-    this.cooldownTimer = setTimeout(() => {
-      this.cooldownEndsAt = undefined;
-      this.attemptReconnect();
-    }, this.options.reconnectDelay);
   }
 
   /**
    * Clear cooldown state
    */
   private clearCooldown(): void {
-    if (this.cooldownTimer) {
-      clearTimeout(this.cooldownTimer);
-      this.cooldownTimer = undefined;
-    }
     this.cooldownEndsAt = undefined;
   }
 
   /**
    * Attempt to reconnect
+   * @returns true if reconnection successful
    */
-  private async attemptReconnect(): Promise<void> {
+  private async attemptReconnect(): Promise<boolean> {
     this.setState('reconnecting');
 
     try {
@@ -659,8 +764,10 @@ export class ResilientCacheClient implements ICacheClient {
 
       // Try to connect
       await this.connect();
+      return this.canExecuteCommands();
     } catch {
       // Connection failed - handled in connect()
+      return false;
     }
   }
 
