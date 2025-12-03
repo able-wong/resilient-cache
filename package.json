@@ -1,6 +1,6 @@
 {
   "name": "resilient-cache",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Resilient Redis/Valkey cache client with graceful degradation, fast failure detection, and delayed reconnection",
   "type": "module",
   "main": "dist/index.js",
