@@ -257,10 +257,10 @@ export class MockCacheClient implements ICacheClient {
     key: string,
     factory: () => Promise<T>,
     ttlSeconds?: number,
-    options?: CallOptions,
+    _options?: CallOptions,
   ): Promise<T> {
-    // Try to get from cache first
-    const cached = await this.get<T>(key, undefined, options);
+    // Try to get from cache first (always graceful - cache failure = cache miss)
+    const cached = await this.get<T>(key, undefined, { onError: 'graceful' });
     if (cached !== null) {
       return cached;
     }
@@ -305,26 +305,21 @@ export class MockCacheClient implements ICacheClient {
       return this.handleError('ttl', -2, options);
     }
 
-    if (this.isExpired(key)) {
-      return -2;
-    }
-
     const item = this.store.get(key);
     if (!item) {
       return -2;
     }
 
-    if (!item.expiresAt) {
-      return -1;
+    if (item.expiresAt) {
+      const remainingMs = item.expiresAt - Date.now();
+      if (remainingMs <= 0) {
+        this.store.delete(key);
+        return -2;
+      }
+      return Math.ceil(remainingMs / 1000);
     }
 
-    const remainingMs = item.expiresAt - Date.now();
-    if (remainingMs <= 0) {
-      this.store.delete(key);
-      return -2;
-    }
-
-    return Math.ceil(remainingMs / 1000);
+    return -1; // No expiry
   }
 
   /**

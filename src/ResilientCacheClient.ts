@@ -408,15 +408,15 @@ export class ResilientCacheClient implements ICacheClient {
     key: string,
     factory: () => Promise<T>,
     ttlSeconds?: number,
-    options?: CallOptions,
+    _options?: CallOptions,
   ): Promise<T> {
     this.validateKey(key);
     if (ttlSeconds !== undefined) {
       this.validateTtl(ttlSeconds);
     }
 
-    // Try to get from cache first
-    const cached = await this.get<T>(key, undefined, options);
+    // Try to get from cache first (always graceful - cache failure = cache miss)
+    const cached = await this.get<T>(key, undefined, { onError: 'graceful' });
     if (cached !== null) {
       return cached;
     }
@@ -424,7 +424,7 @@ export class ResilientCacheClient implements ICacheClient {
     // Cache miss or unavailable - call factory
     const value = await factory();
 
-    // Try to cache the result (best effort, ignore failures)
+    // Try to cache the result (best effort, always graceful)
     await this.set(key, value, ttlSeconds, { onError: 'graceful' });
 
     return value;
