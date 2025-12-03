@@ -89,7 +89,7 @@ const rateLimitKey = keys.forOrg(orgId).key('ratelimit:chat');
 const remaining = await client.decrementOrInit(rateLimitKey, 30, 90);
 
 if (remaining < 0) {
-  throw new RateLimitError('Too many requests');
+  throw new Error('Too many requests');
 }
 ```
 

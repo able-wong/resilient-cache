@@ -69,7 +69,6 @@ export class ResilientCacheClient implements ICacheClient {
   private reconnectAttempts = 0;
   private cooldownEndsAt?: Date;
   private cooldownTimer?: ReturnType<typeof setTimeout>;
-  private reconnectTimer?: ReturnType<typeof setTimeout>;
   private connectPromise: Promise<void> | null = null;
 
   private readonly stateChangeCallbacks: StateChangeCallback[] = [];
@@ -175,7 +174,6 @@ export class ResilientCacheClient implements ICacheClient {
    */
   async disconnect(): Promise<void> {
     this.clearCooldown();
-    this.clearReconnectTimer();
 
     if (this.redis) {
       try {
@@ -592,16 +590,34 @@ export class ResilientCacheClient implements ICacheClient {
    * Handle command error
    */
   private handleCommandError(error: Error, _operation: string): void {
-    // Check if this is a connection error
-    const isConnectionError =
-      error.message.includes('ECONNREFUSED') ||
-      error.message.includes('ETIMEDOUT') ||
-      error.message.includes('ENOTCONN') ||
-      error.message.includes('Connection is closed');
-
-    if (isConnectionError) {
+    if (this.isConnectionError(error)) {
       this.handleConnectionFailure(error);
     }
+  }
+
+  /**
+   * Check if an error is a connection-related error
+   */
+  private isConnectionError(error: Error): boolean {
+    // Check error code first (more reliable for system errors)
+    const errorWithCode = error as Error & { code?: string };
+    if (errorWithCode.code) {
+      const connectionErrorCodes = [
+        'ECONNREFUSED',
+        'ETIMEDOUT',
+        'ENOTCONN',
+        'ECONNRESET',
+        'EPIPE',
+        'EHOSTUNREACH',
+        'ENETUNREACH',
+      ];
+      if (connectionErrorCodes.includes(errorWithCode.code)) {
+        return true;
+      }
+    }
+
+    // Fallback to message check for ioredis-specific errors
+    return error.message.includes('Connection is closed');
   }
 
   /**
@@ -626,16 +642,6 @@ export class ResilientCacheClient implements ICacheClient {
       this.cooldownTimer = undefined;
     }
     this.cooldownEndsAt = undefined;
-  }
-
-  /**
-   * Clear reconnect timer
-   */
-  private clearReconnectTimer(): void {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = undefined;
-    }
   }
 
   /**

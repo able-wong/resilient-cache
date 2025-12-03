@@ -82,6 +82,16 @@ export interface ConnectionStatus {
  */
 export interface ICacheClient {
   /**
+   * Connect to the cache server
+   */
+  connect(): Promise<void>;
+
+  /**
+   * Disconnect from the cache server
+   */
+  disconnect(): Promise<void>;
+
+  /**
    * Get a value from cache
    * @param key - Cache key
    * @param defaultValue - Optional default value if key doesn't exist or cache unavailable

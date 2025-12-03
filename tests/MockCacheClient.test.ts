@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { MockCacheClient } from '../src/MockCacheClient.js';
+import { MockCacheClient, WrongTypeError } from '../src/MockCacheClient.js';
 import { CacheUnavailableError } from '../src/errors.js';
 
 describe('MockCacheClient', () => {
@@ -119,15 +119,32 @@ describe('MockCacheClient', () => {
       expect(result).toBe(15);
     });
 
-    it('should use default value for missing key', async () => {
-      const result = await client.increment('missing', 1, 100);
-      expect(result).toBe(101);
+    it('should initialize missing key with amount (not defaultValue)', async () => {
+      const result = await client.increment('missing', 5, 100);
+      expect(result).toBe(5);
     });
 
     it('should decrement value', async () => {
       await client.set('counter', 10);
       const result = await client.decrement('counter');
       expect(result).toBe(9);
+    });
+
+    it('should throw WrongTypeError when incrementing non-numeric value', async () => {
+      await client.set('string-key', 'not a number');
+      await expect(client.increment('string-key')).rejects.toThrow(
+        WrongTypeError,
+      );
+      await expect(client.increment('string-key')).rejects.toThrow(
+        'WRONGTYPE Operation against a key holding the wrong kind of value (INCRBY)',
+      );
+    });
+
+    it('should throw WrongTypeError when decrementing non-numeric value', async () => {
+      await client.set('string-key', 'not a number');
+      await expect(client.decrement('string-key')).rejects.toThrow(
+        WrongTypeError,
+      );
     });
   });
 
@@ -153,6 +170,19 @@ describe('MockCacheClient', () => {
 
       const result = await client.decrementOrInit('ratelimit', 30, 1);
       expect(result).toBe(30);
+    });
+
+    it('should throw WrongTypeError when key holds non-numeric value', async () => {
+      vi.useFakeTimers();
+      await client.set('string-key', 'not a number', 60);
+      await expect(
+        client.decrementOrInit('string-key', 30, 60),
+      ).rejects.toThrow(WrongTypeError);
+      await expect(
+        client.decrementOrInit('string-key', 30, 60),
+      ).rejects.toThrow(
+        'WRONGTYPE Operation against a key holding the wrong kind of value (DECR)',
+      );
     });
   });
 
@@ -253,6 +283,16 @@ describe('MockCacheClient', () => {
       await client.set('key1', 'value1');
       client.clear();
       expect(client.getStore().size).toBe(0);
+    });
+  });
+
+  describe('connect/disconnect', () => {
+    it('should have no-op connect method', async () => {
+      await expect(client.connect()).resolves.toBeUndefined();
+    });
+
+    it('should have no-op disconnect method', async () => {
+      await expect(client.disconnect()).resolves.toBeUndefined();
     });
   });
 });

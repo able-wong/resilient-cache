@@ -2,7 +2,7 @@
 export { ResilientCacheClient } from './ResilientCacheClient.js';
 export { CacheKeyBuilder } from './CacheKeyBuilder.js';
 export { CacheProvider } from './CacheProvider.js';
-export { MockCacheClient } from './MockCacheClient.js';
+export { MockCacheClient, WrongTypeError } from './MockCacheClient.js';
 
 // Error classes
 export { CacheUnavailableError, CacheTimeoutError } from './errors.js';

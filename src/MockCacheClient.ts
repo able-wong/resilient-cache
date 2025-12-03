@@ -1,6 +1,19 @@
 import type { ICacheClient, CallOptions } from './types.js';
 import { CacheUnavailableError } from './errors.js';
 
+/**
+ * Error thrown when a Redis command is executed against a key holding the wrong type
+ * Matches Redis WRONGTYPE error behavior
+ */
+export class WrongTypeError extends Error {
+  constructor(operation: string) {
+    super(
+      `WRONGTYPE Operation against a key holding the wrong kind of value (${operation})`,
+    );
+    this.name = 'WrongTypeError';
+  }
+}
+
 interface StoredValue {
   value: unknown;
   expiresAt?: number;
@@ -185,13 +198,15 @@ export class MockCacheClient implements ICacheClient {
     }
 
     if (this.isExpired(key)) {
-      this.store.set(key, { value: defaultValue + amount });
-      return defaultValue + amount;
+      this.store.set(key, { value: amount });
+      return amount;
     }
 
     const item = this.store.get(key);
-    const currentValue =
-      typeof item?.value === 'number' ? item.value : defaultValue;
+    if (item && typeof item.value !== 'number') {
+      throw new WrongTypeError('INCRBY');
+    }
+    const currentValue = typeof item?.value === 'number' ? item.value : 0;
     const newValue = currentValue + amount;
     this.store.set(key, { ...item, value: newValue });
     return newValue;
@@ -225,12 +240,27 @@ export class MockCacheClient implements ICacheClient {
       return defaultValue;
     }
 
-    // Key exists - decrement
+    // Key exists - check type before decrement
     const item = this.store.get(key)!;
-    const currentValue =
-      typeof item.value === 'number' ? item.value : defaultValue;
-    const newValue = currentValue - 1;
+    if (typeof item.value !== 'number') {
+      throw new WrongTypeError('DECR');
+    }
+    const newValue = item.value - 1;
     this.store.set(key, { ...item, value: newValue });
     return newValue;
+  }
+
+  /**
+   * Connect to cache (no-op for mock)
+   */
+  async connect(): Promise<void> {
+    // No-op for mock client
+  }
+
+  /**
+   * Disconnect from cache (no-op for mock)
+   */
+  async disconnect(): Promise<void> {
+    // No-op for mock client
   }
 }
