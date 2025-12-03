@@ -1,0 +1,678 @@
+import Redis from 'ioredis';
+import type {
+  CacheClientOptions,
+  CallOptions,
+  ConnectionState,
+  ConnectionStatus,
+  ICacheClient,
+} from './types.js';
+import { CacheUnavailableError, CacheTimeoutError } from './errors.js';
+
+type StateChangeCallback = (status: ConnectionStatus) => void;
+type ErrorCallback = (error: Error) => void;
+
+/** Maximum allowed cache key length */
+const MAX_KEY_LENGTH = 512;
+
+/**
+ * Lua script for atomic decrement-or-init operation
+ * Used for rate limiting: decrements if key exists, otherwise initializes with default
+ */
+const DECREMENT_OR_INIT_SCRIPT = `
+local current = redis.call('GET', KEYS[1])
+if current then
+  return redis.call('DECR', KEYS[1])
+else
+  redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+  return tonumber(ARGV[1])
+end
+`;
+
+/**
+ * Resilient Redis/Valkey cache client with graceful degradation
+ *
+ * Features:
+ * - Fast failure detection with configurable timeouts
+ * - Delayed reconnection with cooldown period
+ * - Graceful degradation (returns defaults when unavailable)
+ * - Per-call error handling override
+ *
+ * @example
+ * ```typescript
+ * const client = new ResilientCacheClient({
+ *   host: 'localhost',
+ *   port: 6379,
+ *   onError: 'graceful', // Default - return null/false when unavailable
+ * });
+ *
+ * await client.connect();
+ *
+ * // Graceful mode - returns null if unavailable
+ * const value = await client.get('mykey');
+ *
+ * // Override to throw for specific calls
+ * try {
+ *   await client.get('mykey', null, { onError: 'throw' });
+ * } catch (e) {
+ *   if (e instanceof CacheUnavailableError) {
+ *     console.log('Cache is down');
+ *   }
+ * }
+ * ```
+ */
+export class ResilientCacheClient implements ICacheClient {
+  private redis: Redis | null = null;
+  private state: ConnectionState = 'disconnected';
+  private lastError?: Error;
+  private lastConnectedAt?: Date;
+  private lastFailedAt?: Date;
+  private reconnectAttempts = 0;
+  private cooldownEndsAt?: Date;
+  private cooldownTimer?: ReturnType<typeof setTimeout>;
+  private reconnectTimer?: ReturnType<typeof setTimeout>;
+  private connectPromise: Promise<void> | null = null;
+
+  private readonly stateChangeCallbacks: StateChangeCallback[] = [];
+  private readonly errorCallbacks: ErrorCallback[] = [];
+
+  // Bound event handlers for cleanup
+  private readonly boundErrorHandler = (error: Error) =>
+    this.handleConnectionFailure(error);
+  private readonly boundCloseHandler = () => {
+    if (this.state === 'connected') {
+      this.handleConnectionFailure(new Error('Connection closed'));
+    }
+  };
+  private readonly boundEndHandler = () => {
+    if (this.state !== 'disconnected') {
+      this.setState('disconnected');
+    }
+  };
+
+  private readonly options: {
+    host: string;
+    port: number;
+    password: string | undefined;
+    connectTimeout: number;
+    commandTimeout: number;
+    reconnectDelay: number;
+    maxReconnectAttempts: number;
+    enableOfflineQueue: boolean;
+    onError: 'graceful' | 'throw';
+  };
+
+  constructor(options: CacheClientOptions) {
+    this.options = {
+      host: options.host,
+      port: options.port,
+      password: options.password,
+      connectTimeout: options.connectTimeout ?? 1000,
+      commandTimeout: options.commandTimeout ?? 500,
+      reconnectDelay: options.reconnectDelay ?? 10000,
+      maxReconnectAttempts: options.maxReconnectAttempts ?? Infinity,
+      enableOfflineQueue: options.enableOfflineQueue ?? false,
+      onError: options.onError ?? 'graceful',
+    };
+  }
+
+  /**
+   * Connect to Redis/Valkey
+   */
+  async connect(): Promise<void> {
+    if (this.state === 'connected') {
+      return;
+    }
+
+    // Deduplicate concurrent connection attempts
+    if (this.connectPromise) {
+      return this.connectPromise;
+    }
+
+    this.connectPromise = this.doConnect();
+    try {
+      await this.connectPromise;
+    } finally {
+      this.connectPromise = null;
+    }
+  }
+
+  /**
+   * Internal connect implementation
+   */
+  private async doConnect(): Promise<void> {
+    // Clear any cooldown state
+    this.clearCooldown();
+
+    this.setState('connecting');
+
+    try {
+      this.redis = new Redis({
+        host: this.options.host,
+        port: this.options.port,
+        password: this.options.password,
+        connectTimeout: this.options.connectTimeout,
+        commandTimeout: this.options.commandTimeout,
+        enableOfflineQueue: this.options.enableOfflineQueue,
+        retryStrategy: () => null, // Disable auto-reconnect
+        lazyConnect: true,
+        maxRetriesPerRequest: 0,
+      });
+
+      this.setupEventHandlers();
+
+      await this.redis.connect();
+      this.setState('connected');
+      this.lastConnectedAt = new Date();
+      this.reconnectAttempts = 0;
+    } catch (error) {
+      this.handleConnectionFailure(error as Error);
+      throw error;
+    }
+  }
+
+  /**
+   * Disconnect from Redis/Valkey
+   */
+  async disconnect(): Promise<void> {
+    this.clearCooldown();
+    this.clearReconnectTimer();
+
+    if (this.redis) {
+      try {
+        // Remove event listeners to prevent memory leaks
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const emitter = this.redis as any;
+        emitter.removeListener('error', this.boundErrorHandler);
+        emitter.removeListener('close', this.boundCloseHandler);
+        emitter.removeListener('end', this.boundEndHandler);
+        this.redis.disconnect();
+      } catch {
+        // Ignore disconnect errors during cleanup
+      } finally {
+        this.redis = null;
+      }
+    }
+
+    this.setState('disconnected');
+  }
+
+  /**
+   * Get current connection status
+   */
+  getStatus(): ConnectionStatus {
+    return {
+      state: this.state,
+      lastError: this.lastError,
+      lastConnectedAt: this.lastConnectedAt,
+      lastFailedAt: this.lastFailedAt,
+      reconnectAttempts: this.reconnectAttempts,
+      cooldownEndsAt: this.cooldownEndsAt,
+    };
+  }
+
+  /**
+   * Check if the client is ready to accept commands
+   */
+  isReady(): boolean {
+    return this.state === 'connected' && this.redis?.status === 'ready';
+  }
+
+  /**
+   * Ping the cache server
+   */
+  async ping(options?: CallOptions): Promise<boolean> {
+    return this.executeCommand('ping', false, options, async () => {
+      await this.redis!.ping();
+      return true;
+    });
+  }
+
+  /**
+   * Get a value from cache
+   */
+  async get<T>(
+    key: string,
+    defaultValue?: T,
+    options?: CallOptions,
+  ): Promise<T | null> {
+    this.validateKey(key);
+    return this.executeCommand(
+      'get',
+      defaultValue ?? null,
+      options,
+      async () => {
+        const result = await this.redis!.get(key);
+        if (result === null) {
+          return defaultValue ?? null;
+        }
+        try {
+          const parsed = JSON.parse(result);
+          return this.sanitizeParsedValue(parsed) as T;
+        } catch {
+          // Return raw string value if not valid JSON
+          return result as unknown as T;
+        }
+      },
+    );
+  }
+
+  /**
+   * Set a value in cache
+   */
+  async set<T>(
+    key: string,
+    value: T,
+    ttlSeconds?: number,
+    options?: CallOptions,
+  ): Promise<boolean> {
+    this.validateKey(key);
+    if (ttlSeconds !== undefined) {
+      this.validateTtl(ttlSeconds);
+    }
+    return this.executeCommand('set', false, options, async () => {
+      const serialized =
+        typeof value === 'string' ? value : JSON.stringify(value);
+      if (ttlSeconds) {
+        await this.redis!.set(key, serialized, 'EX', ttlSeconds);
+      } else {
+        await this.redis!.set(key, serialized);
+      }
+      return true;
+    });
+  }
+
+  /**
+   * Remove a key from cache
+   */
+  async remove(key: string, options?: CallOptions): Promise<boolean> {
+    this.validateKey(key);
+    return this.executeCommand('remove', false, options, async () => {
+      const result = await this.redis!.del(key);
+      return result > 0;
+    });
+  }
+
+  /**
+   * Remove all keys matching a prefix using SCAN (non-blocking)
+   */
+  async removeByPrefix(prefix: string, options?: CallOptions): Promise<number> {
+    return this.executeCommand('removeByPrefix', -1, options, async () => {
+      // Normalize pattern: remove trailing :* if present, then add *
+      const normalizedPrefix = prefix.replace(/:?\*$/, '');
+      const pattern = `${normalizedPrefix}*`;
+
+      let count = 0;
+      let cursor = '0';
+
+      do {
+        const [nextCursor, keys] = await this.redis!.scan(
+          cursor,
+          'MATCH',
+          pattern,
+          'COUNT',
+          100,
+        );
+        cursor = nextCursor;
+
+        if (keys.length > 0) {
+          const deleted = await this.redis!.del(...keys);
+          count += deleted;
+        }
+      } while (cursor !== '0');
+
+      return count;
+    });
+  }
+
+  /**
+   * Remove all keys (FLUSHDB)
+   */
+  async removeAll(options?: CallOptions): Promise<boolean> {
+    return this.executeCommand('removeAll', false, options, async () => {
+      await this.redis!.flushdb();
+      return true;
+    });
+  }
+
+  /**
+   * Increment a numeric value
+   */
+  async increment(
+    key: string,
+    amount: number = 1,
+    defaultValue: number = 0,
+    options?: CallOptions,
+  ): Promise<number> {
+    this.validateKey(key);
+    this.validateNumber(amount, 'amount');
+    return this.executeCommand('increment', defaultValue, options, async () => {
+      const result = await this.redis!.incrby(key, amount);
+      return result;
+    });
+  }
+
+  /**
+   * Decrement a numeric value
+   */
+  async decrement(
+    key: string,
+    amount: number = 1,
+    defaultValue: number = 0,
+    options?: CallOptions,
+  ): Promise<number> {
+    this.validateKey(key);
+    this.validateNumber(amount, 'amount');
+    return this.executeCommand('decrement', defaultValue, options, async () => {
+      const result = await this.redis!.decrby(key, amount);
+      return result;
+    });
+  }
+
+  /**
+   * Atomic decrement or initialize operation
+   * Used for rate limiting - decrements if key exists, otherwise initializes with default
+   */
+  async decrementOrInit(
+    key: string,
+    defaultValue: number,
+    ttlSeconds: number,
+    options?: CallOptions,
+  ): Promise<number> {
+    this.validateKey(key);
+    this.validateNumber(defaultValue, 'defaultValue');
+    this.validateTtl(ttlSeconds);
+    return this.executeCommand(
+      'decrementOrInit',
+      defaultValue,
+      options,
+      async () => {
+        const result = await this.redis!.eval(
+          DECREMENT_OR_INIT_SCRIPT,
+          1,
+          key,
+          defaultValue.toString(),
+          ttlSeconds.toString(),
+        );
+        return Number(result);
+      },
+    );
+  }
+
+  /**
+   * Register a callback for connection state changes
+   */
+  onStateChange(callback: StateChangeCallback): void {
+    this.stateChangeCallbacks.push(callback);
+  }
+
+  /**
+   * Register a callback for errors
+   */
+  onError(callback: ErrorCallback): void {
+    this.errorCallbacks.push(callback);
+  }
+
+  /**
+   * Execute a command with timeout and error handling
+   */
+  private async executeCommand<T>(
+    operation: string,
+    defaultValue: T,
+    options: CallOptions | undefined,
+    command: () => Promise<T>,
+  ): Promise<T> {
+    const onError = options?.onError ?? this.options.onError;
+
+    // Check if we can execute commands
+    if (!this.canExecuteCommands()) {
+      if (onError === 'throw') {
+        throw new CacheUnavailableError(
+          `Cache is unavailable (state: ${this.state})`,
+          this.lastError,
+          operation,
+        );
+      }
+      return defaultValue;
+    }
+
+    const timeout = this.createTimeoutWithCleanup<T>(operation);
+    try {
+      // Wrap command with timeout
+      const result = await Promise.race([command(), timeout.promise]);
+      return result as T;
+    } catch (error) {
+      this.handleCommandError(error as Error, operation);
+
+      if (onError === 'throw') {
+        if (error instanceof CacheTimeoutError) {
+          throw error;
+        }
+        throw new CacheUnavailableError(
+          `Cache operation '${operation}' failed`,
+          error as Error,
+          operation,
+        );
+      }
+      return defaultValue;
+    } finally {
+      timeout.cleanup();
+    }
+  }
+
+  /**
+   * Check if commands can be executed
+   */
+  private canExecuteCommands(): boolean {
+    // During cooldown, immediately return false
+    if (this.state === 'cooldown') {
+      return false;
+    }
+
+    // Only allow commands when connected
+    return this.state === 'connected' && this.redis?.status === 'ready';
+  }
+
+  /**
+   * Create a timeout promise with cleanup
+   */
+  private createTimeoutWithCleanup<T>(operation: string): {
+    promise: Promise<T>;
+    cleanup: () => void;
+  } {
+    let timeoutId: ReturnType<typeof setTimeout>;
+    const promise = new Promise<T>((_, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new CacheTimeoutError(operation, this.options.commandTimeout));
+      }, this.options.commandTimeout);
+    });
+    return {
+      promise,
+      cleanup: () => clearTimeout(timeoutId),
+    };
+  }
+
+  /**
+   * Validate cache key
+   */
+  private validateKey(key: string): void {
+    if (!key || typeof key !== 'string') {
+      throw new TypeError('Cache key must be a non-empty string');
+    }
+    if (key.length > MAX_KEY_LENGTH) {
+      throw new Error(
+        `Cache key exceeds maximum length of ${MAX_KEY_LENGTH} characters`,
+      );
+    }
+    if (key.includes('\n') || key.includes('\r')) {
+      throw new Error('Cache key cannot contain newline characters');
+    }
+  }
+
+  /**
+   * Validate TTL value
+   */
+  private validateTtl(ttlSeconds: number): void {
+    if (!Number.isInteger(ttlSeconds) || ttlSeconds <= 0) {
+      throw new TypeError('ttlSeconds must be a positive integer');
+    }
+  }
+
+  /**
+   * Validate numeric value
+   */
+  private validateNumber(value: number, name: string): void {
+    if (!Number.isFinite(value)) {
+      throw new TypeError(`${name} must be a finite number`);
+    }
+  }
+
+  /**
+   * Sanitize parsed JSON to prevent prototype pollution
+   */
+  private sanitizeParsedValue(value: unknown): unknown {
+    if (value === null || typeof value !== 'object') {
+      return value;
+    }
+
+    if (Array.isArray(value)) {
+      return value.map((item) => this.sanitizeParsedValue(item));
+    }
+
+    // Remove dangerous properties
+    const obj = value as Record<string, unknown>;
+    const sanitized: Record<string, unknown> = {};
+    for (const key of Object.keys(obj)) {
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+        continue;
+      }
+      sanitized[key] = this.sanitizeParsedValue(obj[key]);
+    }
+    return sanitized;
+  }
+
+  /**
+   * Set up Redis event handlers
+   */
+  private setupEventHandlers(): void {
+    if (!this.redis) return;
+
+    this.redis.on('error', this.boundErrorHandler);
+    this.redis.on('close', this.boundCloseHandler);
+    this.redis.on('end', this.boundEndHandler);
+  }
+
+  /**
+   * Handle connection failure
+   */
+  private handleConnectionFailure(error: Error): void {
+    this.lastError = error;
+    this.lastFailedAt = new Date();
+    this.reconnectAttempts++;
+
+    // Notify error callbacks
+    for (const callback of this.errorCallbacks) {
+      try {
+        callback(error);
+      } catch {
+        // Ignore callback errors
+      }
+    }
+
+    // Check if max reconnect attempts reached
+    if (this.reconnectAttempts >= this.options.maxReconnectAttempts) {
+      this.setState('failed');
+      return;
+    }
+
+    // Enter cooldown state
+    this.enterCooldown();
+  }
+
+  /**
+   * Handle command error
+   */
+  private handleCommandError(error: Error, _operation: string): void {
+    // Check if this is a connection error
+    const isConnectionError =
+      error.message.includes('ECONNREFUSED') ||
+      error.message.includes('ETIMEDOUT') ||
+      error.message.includes('ENOTCONN') ||
+      error.message.includes('Connection is closed');
+
+    if (isConnectionError) {
+      this.handleConnectionFailure(error);
+    }
+  }
+
+  /**
+   * Enter cooldown state
+   */
+  private enterCooldown(): void {
+    this.setState('cooldown');
+    this.cooldownEndsAt = new Date(Date.now() + this.options.reconnectDelay);
+
+    this.cooldownTimer = setTimeout(() => {
+      this.cooldownEndsAt = undefined;
+      this.attemptReconnect();
+    }, this.options.reconnectDelay);
+  }
+
+  /**
+   * Clear cooldown state
+   */
+  private clearCooldown(): void {
+    if (this.cooldownTimer) {
+      clearTimeout(this.cooldownTimer);
+      this.cooldownTimer = undefined;
+    }
+    this.cooldownEndsAt = undefined;
+  }
+
+  /**
+   * Clear reconnect timer
+   */
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+  }
+
+  /**
+   * Attempt to reconnect
+   */
+  private async attemptReconnect(): Promise<void> {
+    this.setState('reconnecting');
+
+    try {
+      // Disconnect existing connection if any
+      if (this.redis) {
+        this.redis.disconnect();
+        this.redis = null;
+      }
+
+      // Try to connect
+      await this.connect();
+    } catch {
+      // Connection failed - handled in connect()
+    }
+  }
+
+  /**
+   * Set connection state and notify callbacks
+   */
+  private setState(newState: ConnectionState): void {
+    if (this.state === newState) return;
+
+    this.state = newState;
+
+    const status = this.getStatus();
+    for (const callback of this.stateChangeCallbacks) {
+      try {
+        callback(status);
+      } catch {
+        // Ignore callback errors
+      }
+    }
+  }
+}

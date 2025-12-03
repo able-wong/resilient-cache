@@ -1,0 +1,28 @@
+# Docker Compose for running integration tests
+#
+# Usage:
+#   docker compose up -d        # Start Redis
+#   npm run test:integration    # Run integration tests
+#   docker compose down         # Stop Redis
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Alternative: Valkey (Redis fork)
+  # valkey:
+  #   image: valkey/valkey:7-alpine
+  #   ports:
+  #     - "6379:6379"
+  #   healthcheck:
+  #     test: ["CMD", "valkey-cli", "ping"]
+  #     interval: 5s
+  #     timeout: 3s
+  #     retries: 5
