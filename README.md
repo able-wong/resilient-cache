@@ -327,6 +327,17 @@ Request 1 → connection succeeds → returns real value
 Request N → now connected → returns real value
 ```
 
+### Forcing Reconnection During Cooldown
+
+If you need to bypass the circuit breaker and force an immediate reconnection (e.g., after a deployment or manual intervention), call `connect()` explicitly:
+
+```typescript
+// Force reconnection even during cooldown
+await client.connect();
+```
+
+This clears the cooldown state and attempts to connect immediately. If it fails, the client enters cooldown again.
+
 ### When to Use Throw Mode
 
 Use `{ onError: 'throw' }` only when you need to **know** if cache failed:
