@@ -322,5 +322,160 @@ describe('ResilientCacheClient Integration Tests', () => {
       expect(states).toContain('connected');
       expect(states).toContain('disconnected');
     });
+
+    it('should track lastSuccessAt on successful operations', async () => {
+      const beforeOp = new Date();
+      await client.ping();
+      const status = client.getStatus();
+
+      expect(status.lastSuccessAt).toBeInstanceOf(Date);
+      expect(status.lastSuccessAt!.getTime()).toBeGreaterThanOrEqual(
+        beforeOp.getTime(),
+      );
+    });
+  });
+
+  describe('exists', () => {
+    it('should return true for existing key', async () => {
+      const key = `${testPrefix}:exists:yes`;
+      await client.set(key, 'value');
+
+      const result = await client.exists(key);
+      expect(result).toBe(true);
+    });
+
+    it('should return false for non-existent key', async () => {
+      const result = await client.exists(`${testPrefix}:exists:no`);
+      expect(result).toBe(false);
+    });
+
+    it('should return false for expired key', async () => {
+      const key = `${testPrefix}:exists:expired`;
+      await client.set(key, 'value', 1);
+
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+
+      const result = await client.exists(key);
+      expect(result).toBe(false);
+    });
+  });
+
+  describe('ttl', () => {
+    it('should return TTL in seconds', async () => {
+      const key = `${testPrefix}:ttl:check`;
+      await client.set(key, 'value', 60);
+
+      const ttl = await client.ttl(key);
+      expect(ttl).toBeGreaterThan(0);
+      expect(ttl).toBeLessThanOrEqual(60);
+    });
+
+    it('should return -1 for key without TTL', async () => {
+      const key = `${testPrefix}:ttl:noexpiry`;
+      await client.set(key, 'value'); // No TTL
+
+      const ttl = await client.ttl(key);
+      expect(ttl).toBe(-1);
+    });
+
+    it('should return -2 for non-existent key', async () => {
+      const ttl = await client.ttl(`${testPrefix}:ttl:nonexistent`);
+      expect(ttl).toBe(-2);
+    });
+  });
+
+  describe('getOrSet', () => {
+    it('should return cached value on hit', async () => {
+      const key = `${testPrefix}:getOrSet:hit`;
+      await client.set(key, 'cached-value');
+
+      let factoryCalled = false;
+      const result = await client.getOrSet(key, async () => {
+        factoryCalled = true;
+        return 'new-value';
+      });
+
+      expect(result).toBe('cached-value');
+      expect(factoryCalled).toBe(false);
+    });
+
+    it('should call factory and cache on miss', async () => {
+      const key = `${testPrefix}:getOrSet:miss`;
+
+      let factoryCalled = false;
+      const result = await client.getOrSet(
+        key,
+        async () => {
+          factoryCalled = true;
+          return { data: 'fresh' };
+        },
+        60,
+      );
+
+      expect(result).toEqual({ data: 'fresh' });
+      expect(factoryCalled).toBe(true);
+
+      // Verify it was cached
+      const cached = await client.get(key);
+      expect(cached).toEqual({ data: 'fresh' });
+    });
+
+    it('should respect TTL for cached value', async () => {
+      const key = `${testPrefix}:getOrSet:ttl`;
+
+      await client.getOrSet(
+        key,
+        async () => 'value',
+        2, // 2 second TTL
+      );
+
+      const ttl = await client.ttl(key);
+      expect(ttl).toBeGreaterThan(0);
+      expect(ttl).toBeLessThanOrEqual(2);
+    });
+
+    it('should handle async factory functions', async () => {
+      const key = `${testPrefix}:getOrSet:async`;
+
+      const result = await client.getOrSet(key, async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return { computed: true };
+      });
+
+      expect(result).toEqual({ computed: true });
+    });
+  });
+
+  describe('auto-connect', () => {
+    it('should auto-connect on first command', async () => {
+      const autoClient = new ResilientCacheClient({
+        host: REDIS_HOST,
+        port: REDIS_PORT,
+        // autoConnect: true is default
+      });
+
+      // Don't call connect() explicitly
+      expect(autoClient.getStatus().state).toBe('disconnected');
+
+      // First command should trigger auto-connect
+      const result = await autoClient.ping();
+      expect(result).toBe(true);
+      expect(autoClient.getStatus().state).toBe('connected');
+
+      await autoClient.disconnect();
+    });
+
+    it('should not auto-connect when disabled', async () => {
+      const noAutoClient = new ResilientCacheClient({
+        host: REDIS_HOST,
+        port: REDIS_PORT,
+        autoConnect: false,
+      });
+
+      // Commands should return default values without connecting
+      const result = await noAutoClient.get('key', 'default');
+      expect(result).toBe('default');
+      expect(noAutoClient.getStatus().state).toBe('disconnected');
+    });
   });
 });

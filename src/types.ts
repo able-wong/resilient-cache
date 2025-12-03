@@ -32,6 +32,13 @@ export interface CacheClientOptions {
    * - 'throw': Throw CacheUnavailableError when cache unavailable
    */
   onError?: 'graceful' | 'throw';
+
+  /**
+   * Auto-connect on first command (default: true)
+   * When true, connect() is called automatically when the first command is issued.
+   * When false, you must call connect() explicitly before issuing commands.
+   */
+  autoConnect?: boolean;
 }
 
 /**
@@ -74,6 +81,9 @@ export interface ConnectionStatus {
 
   /** When the cooldown period ends (if in cooldown state) */
   cooldownEndsAt?: Date;
+
+  /** Timestamp of last successful command execution */
+  lastSuccessAt?: Date;
 }
 
 /**
@@ -191,6 +201,37 @@ export interface ICacheClient {
     ttlSeconds: number,
     options?: CallOptions,
   ): Promise<number>;
+
+  /**
+   * Get a value from cache, or set it using a factory function if not found
+   * @param key - Cache key
+   * @param factory - Async function to generate the value if cache miss
+   * @param ttlSeconds - Time to live in seconds (optional)
+   * @param options - Per-call options
+   * @returns The cached or newly generated value
+   */
+  getOrSet<T>(
+    key: string,
+    factory: () => Promise<T>,
+    ttlSeconds?: number,
+    options?: CallOptions,
+  ): Promise<T>;
+
+  /**
+   * Check if a key exists in cache
+   * @param key - Cache key
+   * @param options - Per-call options
+   * @returns true if key exists, false otherwise (or if unavailable in graceful mode)
+   */
+  exists(key: string, options?: CallOptions): Promise<boolean>;
+
+  /**
+   * Get the remaining TTL of a key in seconds
+   * @param key - Cache key
+   * @param options - Per-call options
+   * @returns TTL in seconds, -1 if no TTL set, -2 if key doesn't exist (or if unavailable in graceful mode)
+   */
+  ttl(key: string, options?: CallOptions): Promise<number>;
 }
 
 /**

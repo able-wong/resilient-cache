@@ -251,6 +251,78 @@ export class MockCacheClient implements ICacheClient {
   }
 
   /**
+   * Get a value from cache, or set it using a factory function if not found
+   */
+  async getOrSet<T>(
+    key: string,
+    factory: () => Promise<T>,
+    ttlSeconds?: number,
+    _options?: CallOptions,
+  ): Promise<T> {
+    // Try to get from cache first (always graceful - cache failure = cache miss)
+    const cached = await this.get<T>(key, undefined, { onError: 'graceful' });
+    if (cached !== null) {
+      return cached;
+    }
+
+    // Cache miss or unavailable - call factory
+    const value = await factory();
+
+    // Try to cache the result (best effort)
+    if (!this.simulateFailure) {
+      const storedValue: StoredValue = {
+        value,
+        expiresAt: ttlSeconds ? Date.now() + ttlSeconds * 1000 : undefined,
+      };
+      this.store.set(key, storedValue);
+    }
+
+    return value;
+  }
+
+  /**
+   * Check if a key exists in cache
+   */
+  async exists(key: string, options?: CallOptions): Promise<boolean> {
+    if (this.simulateFailure) {
+      return this.handleError('exists', false, options);
+    }
+
+    if (this.isExpired(key)) {
+      return false;
+    }
+
+    return this.store.has(key);
+  }
+
+  /**
+   * Get the remaining TTL of a key in seconds
+   * Returns -1 if key exists but has no TTL
+   * Returns -2 if key doesn't exist
+   */
+  async ttl(key: string, options?: CallOptions): Promise<number> {
+    if (this.simulateFailure) {
+      return this.handleError('ttl', -2, options);
+    }
+
+    const item = this.store.get(key);
+    if (!item) {
+      return -2;
+    }
+
+    if (item.expiresAt) {
+      const remainingMs = item.expiresAt - Date.now();
+      if (remainingMs <= 0) {
+        this.store.delete(key);
+        return -2;
+      }
+      return Math.ceil(remainingMs / 1000);
+    }
+
+    return -1; // No expiry
+  }
+
+  /**
    * Connect to cache (no-op for mock)
    */
   async connect(): Promise<void> {
