@@ -304,7 +304,7 @@ const client = new ResilientCacheClient({
 | `exists(key, options?)` | `false` | throws `CacheUnavailableError` |
 | `ttl(key, options?)` | `-2` | throws `CacheUnavailableError` |
 | `setIfNotExists<T>(key, value, ttlSeconds?, options?)` | `false` | throws `CacheUnavailableError` |
-| `getMany<T>(keys, options?)` | `(null)[]` | throws `CacheUnavailableError` |
+| `getMany<T>(keys, options?)` | `null[]` (same length as input) | throws `CacheUnavailableError` |
 | `setMany<T>(entries, ttlSeconds?, options?)` | `false` | throws `CacheUnavailableError` |
 | `expire(key, ttlSeconds, options?)` | `false` | throws `CacheUnavailableError` |
 

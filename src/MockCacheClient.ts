@@ -442,10 +442,8 @@ export class MockCacheClient implements ICacheClient {
       return false;
     }
 
-    const item = this.store.get(key);
-    if (!item) {
-      return false;
-    }
+    // After isExpired check, we know the key exists and is not expired
+    const item = this.store.get(key)!;
 
     // Update the expiry time
     this.store.set(key, {

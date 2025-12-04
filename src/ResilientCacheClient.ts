@@ -558,10 +558,10 @@ export class ResilientCacheClient implements ICacheClient {
     }
     return this.executeCommand('setMany', false, options, async () => {
       // Build key-value pairs for MSET
-      const args: string[] = [];
-      for (const entry of entries) {
-        args.push(entry.key, this.serialize(entry.value));
-      }
+      const args = entries.flatMap((entry) => [
+        entry.key,
+        this.serialize(entry.value),
+      ]);
 
       if (ttlSeconds) {
         // Use pipeline: MSET + EXPIRE for each key
