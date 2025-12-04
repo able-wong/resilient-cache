@@ -72,7 +72,62 @@ const userData = await client.getOrSet(
   3600 // TTL in seconds
 );
 // Returns cached value if available, otherwise calls factory and caches result
+
+// With staleness validation - refetch if cached value is stale
+const prompts = await client.getOrSet(
+  keys.forTenant(tenant).key('prompts'),
+  async () => fetchPromptsFromDatabase(tenant),
+  7200,
+  {
+    isValid: (cached) => cached.version >= requiredVersion
+  }
+);
+// If isValid returns false, factory is called and cache is updated
 ```
+
+### Batch Operations
+
+```typescript
+// Fetch multiple keys in one round trip
+const keys = ['user:1', 'user:2', 'user:3'];
+const users = await client.getMany<User>(keys);
+// Returns [User | null, User | null, User | null]
+
+// Set multiple keys with same TTL
+await client.setMany([
+  { key: 'user:1', value: user1 },
+  { key: 'user:2', value: user2 },
+], 3600);
+```
+
+### Distributed Locks with setIfNotExists
+
+```typescript
+// Simple lock - graceful mode (cache down = lock not acquired)
+const acquired = await client.setIfNotExists(lockKey, 'owner-id', 30);
+if (acquired) {
+  try {
+    // Do critical work
+  } finally {
+    await client.remove(lockKey);
+  }
+}
+
+// For mutex where you need to distinguish "lock held" vs "cache down":
+try {
+  const acquired = await client.setIfNotExists(lockKey, 'owner-id', 30, { onError: 'throw' });
+  if (!acquired) {
+    console.log('Lock held by another process');
+  }
+} catch (e) {
+  if (e instanceof CacheUnavailableError) {
+    console.log('Cache unavailable - cannot acquire lock');
+    // Handle differently: retry, fail, or proceed without lock
+  }
+}
+```
+
+**Note:** In graceful mode (default), `setIfNotExists` returns `false` both when the key already exists AND when cache is unavailable. For mutex patterns where this distinction matters, use `{ onError: 'throw' }`.
 
 ### Throw Mode for Specific Calls
 
@@ -248,6 +303,16 @@ const client = new ResilientCacheClient({
 | `getOrSet<T>(key, factory, ttlSeconds?, options?)` | factory result | throws `CacheUnavailableError` |
 | `exists(key, options?)` | `false` | throws `CacheUnavailableError` |
 | `ttl(key, options?)` | `-2` | throws `CacheUnavailableError` |
+| `setIfNotExists<T>(key, value, ttlSeconds?, options?)` | `false` | throws `CacheUnavailableError` |
+| `getMany<T>(keys, options?)` | `(null)[]` | throws `CacheUnavailableError` |
+| `setMany<T>(entries, ttlSeconds?, options?)` | `false` | throws `CacheUnavailableError` |
+| `expire(key, ttlSeconds, options?)` | `false` | throws `CacheUnavailableError` |
+
+**`getOrSet` options:**
+- `isValid?: (value: T) => boolean | Promise<boolean>` - Optional validator called when cache hits. Return `false` to treat value as stale (triggers factory call and cache update).
+
+**`setIfNotExists` note:**
+- In graceful mode, returns `false` both when key exists AND when cache is unavailable. For mutex/lock patterns, use `{ onError: 'throw' }` to distinguish these cases.
 
 ### CacheKeyBuilder
 

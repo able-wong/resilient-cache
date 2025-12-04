@@ -404,5 +404,247 @@ describe('MockCacheClient', () => {
         'Factory failed',
       );
     });
+
+    it('should use cached value when isValid returns true', async () => {
+      await client.set('key', { version: 2, data: 'cached' });
+      const factory = vi.fn().mockResolvedValue({ version: 3, data: 'new' });
+      const isValid = vi.fn().mockReturnValue(true);
+
+      const result = await client.getOrSet('key', factory, 60, { isValid });
+
+      expect(result).toEqual({ version: 2, data: 'cached' });
+      expect(isValid).toHaveBeenCalledWith({ version: 2, data: 'cached' });
+      expect(factory).not.toHaveBeenCalled();
+    });
+
+    it('should call factory when isValid returns false (stale)', async () => {
+      await client.set('key', { version: 1, data: 'old' });
+      const factory = vi.fn().mockResolvedValue({ version: 2, data: 'new' });
+      const isValid = vi.fn().mockReturnValue(false);
+
+      const result = await client.getOrSet('key', factory, 60, { isValid });
+
+      expect(result).toEqual({ version: 2, data: 'new' });
+      expect(isValid).toHaveBeenCalledWith({ version: 1, data: 'old' });
+      expect(factory).toHaveBeenCalledOnce();
+      // Verify cache was updated
+      expect(await client.get('key')).toEqual({ version: 2, data: 'new' });
+    });
+
+    it('should support async isValid validator', async () => {
+      await client.set('key', { version: 1 });
+      const factory = vi.fn().mockResolvedValue({ version: 2 });
+      const isValid = vi.fn().mockResolvedValue(false); // async validator
+
+      const result = await client.getOrSet('key', factory, 60, { isValid });
+
+      expect(result).toEqual({ version: 2 });
+      expect(factory).toHaveBeenCalledOnce();
+    });
+
+    it('should not call isValid on cache miss', async () => {
+      const factory = vi.fn().mockResolvedValue({ data: 'new' });
+      const isValid = vi.fn().mockReturnValue(true);
+
+      const result = await client.getOrSet('missing-key', factory, 60, {
+        isValid,
+      });
+
+      expect(result).toEqual({ data: 'new' });
+      expect(isValid).not.toHaveBeenCalled();
+      expect(factory).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('setIfNotExists', () => {
+    it('should set value when key does not exist', async () => {
+      const result = await client.setIfNotExists('new-key', 'value', 60);
+      expect(result).toBe(true);
+      expect(await client.get('new-key')).toBe('value');
+    });
+
+    it('should not set value when key already exists', async () => {
+      await client.set('existing-key', 'original');
+      const result = await client.setIfNotExists('existing-key', 'new-value');
+      expect(result).toBe(false);
+      expect(await client.get('existing-key')).toBe('original');
+    });
+
+    it('should set value when key has expired', async () => {
+      vi.useFakeTimers();
+      await client.set('expiring-key', 'old', 1);
+      vi.advanceTimersByTime(2000);
+      const result = await client.setIfNotExists('expiring-key', 'new');
+      expect(result).toBe(true);
+      expect(await client.get('expiring-key')).toBe('new');
+    });
+
+    it('should respect TTL parameter', async () => {
+      vi.useFakeTimers();
+      await client.setIfNotExists('key', 'value', 60);
+      const ttl = await client.ttl('key');
+      expect(ttl).toBe(60);
+    });
+
+    it('should return false when simulating failure (graceful mode)', async () => {
+      client.setSimulateFailure(true);
+      const result = await client.setIfNotExists('key', 'value');
+      expect(result).toBe(false);
+    });
+
+    it('should throw when simulating failure (throw mode)', async () => {
+      client.setSimulateFailure(true);
+      await expect(
+        client.setIfNotExists('key', 'value', 60, { onError: 'throw' }),
+      ).rejects.toThrow(CacheUnavailableError);
+    });
+  });
+
+  describe('getMany', () => {
+    it('should return values for multiple keys', async () => {
+      await client.set('key1', 'value1');
+      await client.set('key2', 'value2');
+      await client.set('key3', 'value3');
+
+      const result = await client.getMany(['key1', 'key2', 'key3']);
+      expect(result).toEqual(['value1', 'value2', 'value3']);
+    });
+
+    it('should return null for missing keys', async () => {
+      await client.set('key1', 'value1');
+
+      const result = await client.getMany(['key1', 'missing', 'key1']);
+      expect(result).toEqual(['value1', null, 'value1']);
+    });
+
+    it('should return empty array for empty keys', async () => {
+      const result = await client.getMany([]);
+      expect(result).toEqual([]);
+    });
+
+    it('should return null for expired keys', async () => {
+      vi.useFakeTimers();
+      await client.set('key1', 'value1', 1);
+      await client.set('key2', 'value2', 60);
+      vi.advanceTimersByTime(2000);
+
+      const result = await client.getMany(['key1', 'key2']);
+      expect(result).toEqual([null, 'value2']);
+    });
+
+    it('should return array of nulls when simulating failure (graceful mode)', async () => {
+      client.setSimulateFailure(true);
+      const result = await client.getMany(['key1', 'key2', 'key3']);
+      expect(result).toEqual([null, null, null]);
+    });
+
+    it('should throw when simulating failure (throw mode)', async () => {
+      client.setSimulateFailure(true);
+      await expect(
+        client.getMany(['key1', 'key2'], { onError: 'throw' }),
+      ).rejects.toThrow(CacheUnavailableError);
+    });
+
+    it('should handle object values', async () => {
+      await client.set('key1', { name: 'Alice' });
+      await client.set('key2', { name: 'Bob' });
+
+      const result = await client.getMany<{ name: string }>(['key1', 'key2']);
+      expect(result).toEqual([{ name: 'Alice' }, { name: 'Bob' }]);
+    });
+  });
+
+  describe('setMany', () => {
+    it('should set multiple key-value pairs', async () => {
+      const result = await client.setMany([
+        { key: 'key1', value: 'value1' },
+        { key: 'key2', value: 'value2' },
+      ]);
+      expect(result).toBe(true);
+      expect(await client.get('key1')).toBe('value1');
+      expect(await client.get('key2')).toBe('value2');
+    });
+
+    it('should return true for empty entries', async () => {
+      const result = await client.setMany([]);
+      expect(result).toBe(true);
+    });
+
+    it('should respect TTL parameter', async () => {
+      vi.useFakeTimers();
+      await client.setMany(
+        [
+          { key: 'key1', value: 'value1' },
+          { key: 'key2', value: 'value2' },
+        ],
+        60,
+      );
+
+      expect(await client.ttl('key1')).toBe(60);
+      expect(await client.ttl('key2')).toBe(60);
+    });
+
+    it('should return false when simulating failure (graceful mode)', async () => {
+      client.setSimulateFailure(true);
+      const result = await client.setMany([{ key: 'key1', value: 'value1' }]);
+      expect(result).toBe(false);
+    });
+
+    it('should throw when simulating failure (throw mode)', async () => {
+      client.setSimulateFailure(true);
+      await expect(
+        client.setMany([{ key: 'key1', value: 'value1' }], 60, {
+          onError: 'throw',
+        }),
+      ).rejects.toThrow(CacheUnavailableError);
+    });
+
+    it('should handle object values', async () => {
+      await client.setMany([
+        { key: 'key1', value: { name: 'Alice' } },
+        { key: 'key2', value: { name: 'Bob' } },
+      ]);
+
+      expect(await client.get('key1')).toEqual({ name: 'Alice' });
+      expect(await client.get('key2')).toEqual({ name: 'Bob' });
+    });
+  });
+
+  describe('expire', () => {
+    it('should update TTL of existing key', async () => {
+      vi.useFakeTimers();
+      await client.set('key', 'value', 30);
+      const result = await client.expire('key', 120);
+      expect(result).toBe(true);
+      expect(await client.ttl('key')).toBe(120);
+    });
+
+    it('should return false for non-existent key', async () => {
+      const result = await client.expire('missing', 60);
+      expect(result).toBe(false);
+    });
+
+    it('should return false for expired key', async () => {
+      vi.useFakeTimers();
+      await client.set('key', 'value', 1);
+      vi.advanceTimersByTime(2000);
+      const result = await client.expire('key', 60);
+      expect(result).toBe(false);
+    });
+
+    it('should return false when simulating failure (graceful mode)', async () => {
+      await client.set('key', 'value');
+      client.setSimulateFailure(true);
+      const result = await client.expire('key', 60);
+      expect(result).toBe(false);
+    });
+
+    it('should throw when simulating failure (throw mode)', async () => {
+      await client.set('key', 'value');
+      client.setSimulateFailure(true);
+      await expect(
+        client.expire('key', 60, { onError: 'throw' }),
+      ).rejects.toThrow(CacheUnavailableError);
+    });
   });
 });

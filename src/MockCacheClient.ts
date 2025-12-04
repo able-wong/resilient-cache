@@ -1,4 +1,4 @@
-import type { ICacheClient, CallOptions } from './types.js';
+import type { ICacheClient, CallOptions, GetOrSetOptions } from './types.js';
 import { CacheUnavailableError } from './errors.js';
 
 /**
@@ -252,16 +252,35 @@ export class MockCacheClient implements ICacheClient {
 
   /**
    * Get a value from cache, or set it using a factory function if not found
+   * Supports optional staleness validation via isValid option
    */
   async getOrSet<T>(
     key: string,
     factory: () => Promise<T>,
     ttlSeconds?: number,
-    _options?: CallOptions,
+    options?: GetOrSetOptions<T>,
   ): Promise<T> {
     // Try to get from cache first (always graceful - cache failure = cache miss)
     const cached = await this.get<T>(key, undefined, { onError: 'graceful' });
     if (cached !== null) {
+      // If validator provided, check if cached value is still valid
+      if (options?.isValid) {
+        const isValid = await options.isValid(cached);
+        if (!isValid) {
+          // Cached value is stale - fetch fresh value
+          const value = await factory();
+          if (!this.simulateFailure) {
+            const storedValue: StoredValue = {
+              value,
+              expiresAt: ttlSeconds
+                ? Date.now() + ttlSeconds * 1000
+                : undefined,
+            };
+            this.store.set(key, storedValue);
+          }
+          return value;
+        }
+      }
       return cached;
     }
 
@@ -320,6 +339,120 @@ export class MockCacheClient implements ICacheClient {
     }
 
     return -1; // No expiry
+  }
+
+  /**
+   * Set a value only if the key does not exist (SETNX)
+   * Useful for distributed locks and deduplication
+   *
+   * @note In graceful mode (default), returns false both when key exists AND when cache is unavailable.
+   * For mutex/lock patterns where you need to distinguish these cases, use { onError: 'throw' }.
+   */
+  async setIfNotExists<T>(
+    key: string,
+    value: T,
+    ttlSeconds?: number,
+    options?: CallOptions,
+  ): Promise<boolean> {
+    if (this.simulateFailure) {
+      return this.handleError('setIfNotExists', false, options);
+    }
+
+    // Check if key already exists (and not expired)
+    if (!this.isExpired(key) && this.store.has(key)) {
+      return false;
+    }
+
+    // Key doesn't exist - set it
+    const storedValue: StoredValue = {
+      value,
+      expiresAt: ttlSeconds ? Date.now() + ttlSeconds * 1000 : undefined,
+    };
+    this.store.set(key, storedValue);
+    return true;
+  }
+
+  /**
+   * Get multiple values from cache in a single round trip (MGET)
+   */
+  async getMany<T>(
+    keys: string[],
+    options?: CallOptions,
+  ): Promise<(T | null)[]> {
+    if (keys.length === 0) {
+      return [];
+    }
+
+    if (this.simulateFailure) {
+      return this.handleError(
+        'getMany',
+        keys.map(() => null),
+        options,
+      );
+    }
+
+    return keys.map((key) => {
+      if (this.isExpired(key)) {
+        return null;
+      }
+      const item = this.store.get(key);
+      return (item?.value as T) ?? null;
+    });
+  }
+
+  /**
+   * Set multiple key-value pairs in cache (MSET)
+   */
+  async setMany<T>(
+    entries: Array<{ key: string; value: T }>,
+    ttlSeconds?: number,
+    options?: CallOptions,
+  ): Promise<boolean> {
+    if (entries.length === 0) {
+      return true;
+    }
+
+    if (this.simulateFailure) {
+      return this.handleError('setMany', false, options);
+    }
+
+    for (const entry of entries) {
+      const storedValue: StoredValue = {
+        value: entry.value,
+        expiresAt: ttlSeconds ? Date.now() + ttlSeconds * 1000 : undefined,
+      };
+      this.store.set(entry.key, storedValue);
+    }
+    return true;
+  }
+
+  /**
+   * Update the TTL of an existing key without changing its value (EXPIRE)
+   */
+  async expire(
+    key: string,
+    ttlSeconds: number,
+    options?: CallOptions,
+  ): Promise<boolean> {
+    if (this.simulateFailure) {
+      return this.handleError('expire', false, options);
+    }
+
+    if (this.isExpired(key)) {
+      return false;
+    }
+
+    const item = this.store.get(key);
+    if (!item) {
+      return false;
+    }
+
+    // Update the expiry time
+    this.store.set(key, {
+      ...item,
+      expiresAt: Date.now() + ttlSeconds * 1000,
+    });
+    return true;
   }
 
   /**
