@@ -50,6 +50,19 @@ export interface CallOptions {
 }
 
 /**
+ * Options for getOrSet method
+ */
+export interface GetOrSetOptions<T> extends CallOptions {
+  /**
+   * Optional validator to check if a cached value is still valid/fresh.
+   * Called when a cached value is found.
+   * Return false to treat the cached value as stale (will call factory and update cache).
+   * Return true to use the cached value as-is.
+   */
+  isValid?: (value: T) => boolean | Promise<boolean>;
+}
+
+/**
  * Connection state of the cache client
  */
 export type ConnectionState =
@@ -207,14 +220,14 @@ export interface ICacheClient {
    * @param key - Cache key
    * @param factory - Async function to generate the value if cache miss
    * @param ttlSeconds - Time to live in seconds (optional)
-   * @param options - Per-call options
+   * @param options - Options including optional isValid validator
    * @returns The cached or newly generated value
    */
   getOrSet<T>(
     key: string,
     factory: () => Promise<T>,
     ttlSeconds?: number,
-    options?: CallOptions,
+    options?: GetOrSetOptions<T>,
   ): Promise<T>;
 
   /**
@@ -232,6 +245,60 @@ export interface ICacheClient {
    * @returns TTL in seconds, -1 if no TTL set, -2 if key doesn't exist (or if unavailable in graceful mode)
    */
   ttl(key: string, options?: CallOptions): Promise<number>;
+
+  /**
+   * Set a value only if the key does not exist (SETNX)
+   * Useful for distributed locks and deduplication
+   *
+   * @param key - Cache key
+   * @param value - Value to store
+   * @param ttlSeconds - Time to live in seconds (optional but recommended for locks)
+   * @param options - Per-call options
+   * @returns true if key was set (didn't exist), false if key already exists
+   *
+   * @note In graceful mode (default), returns false both when key exists AND when cache is unavailable.
+   * For mutex/lock patterns where you need to distinguish these cases, use { onError: 'throw' }.
+   */
+  setIfNotExists<T>(
+    key: string,
+    value: T,
+    ttlSeconds?: number,
+    options?: CallOptions,
+  ): Promise<boolean>;
+
+  /**
+   * Get multiple values from cache in a single round trip (MGET)
+   * @param keys - Array of cache keys
+   * @param options - Per-call options
+   * @returns Array of values in same order as keys, null for missing keys
+   */
+  getMany<T>(keys: string[], options?: CallOptions): Promise<(T | null)[]>;
+
+  /**
+   * Set multiple key-value pairs in cache (MSET)
+   * @param entries - Array of { key, value } pairs
+   * @param ttlSeconds - Time to live in seconds (optional, applies to all keys)
+   * @param options - Per-call options
+   * @returns true if all keys were set successfully
+   */
+  setMany<T>(
+    entries: Array<{ key: string; value: T }>,
+    ttlSeconds?: number,
+    options?: CallOptions,
+  ): Promise<boolean>;
+
+  /**
+   * Update the TTL of an existing key without changing its value (EXPIRE)
+   * @param key - Cache key
+   * @param ttlSeconds - New time to live in seconds
+   * @param options - Per-call options
+   * @returns true if key exists and TTL was set, false if key doesn't exist
+   */
+  expire(
+    key: string,
+    ttlSeconds: number,
+    options?: CallOptions,
+  ): Promise<boolean>;
 }
 
 /**

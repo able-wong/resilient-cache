@@ -4,6 +4,7 @@ import type {
   CallOptions,
   ConnectionState,
   ConnectionStatus,
+  GetOrSetOptions,
   ICacheClient,
 } from './types.js';
 import { CacheUnavailableError, CacheTimeoutError } from './errors.js';
@@ -272,8 +273,7 @@ export class ResilientCacheClient implements ICacheClient {
       this.validateTtl(ttlSeconds);
     }
     return this.executeCommand('set', false, options, async () => {
-      const serialized =
-        typeof value === 'string' ? value : JSON.stringify(value);
+      const serialized = this.serialize(value);
       if (ttlSeconds) {
         await this.redis!.set(key, serialized, 'EX', ttlSeconds);
       } else {
@@ -402,13 +402,18 @@ export class ResilientCacheClient implements ICacheClient {
 
   /**
    * Get a value from cache, or set it using a factory function if not found
-   * Implements the cache-aside pattern
+   * Implements the cache-aside pattern with optional staleness validation
+   *
+   * @param key - Cache key
+   * @param factory - Async function to generate the value if cache miss or stale
+   * @param ttlSeconds - Time to live in seconds (optional)
+   * @param options - Options including optional isValid validator
    */
   async getOrSet<T>(
     key: string,
     factory: () => Promise<T>,
     ttlSeconds?: number,
-    _options?: CallOptions,
+    options?: GetOrSetOptions<T>,
   ): Promise<T> {
     this.validateKey(key);
     if (ttlSeconds !== undefined) {
@@ -418,6 +423,16 @@ export class ResilientCacheClient implements ICacheClient {
     // Try to get from cache first (always graceful - cache failure = cache miss)
     const cached = await this.get<T>(key, undefined, { onError: 'graceful' });
     if (cached !== null) {
+      // If validator provided, check if cached value is still valid
+      if (options?.isValid) {
+        const isValid = await options.isValid(cached);
+        if (!isValid) {
+          // Cached value is stale - fetch fresh value
+          const value = await factory();
+          await this.set(key, value, ttlSeconds, { onError: 'graceful' });
+          return value;
+        }
+      }
       return cached;
     }
 
@@ -451,6 +466,136 @@ export class ResilientCacheClient implements ICacheClient {
     return this.executeCommand('ttl', -2, options, async () => {
       const result = await this.redis!.ttl(key);
       return result;
+    });
+  }
+
+  /**
+   * Set a value only if the key does not exist (SETNX)
+   * Useful for distributed locks and deduplication
+   *
+   * @note In graceful mode (default), returns false both when key exists AND when cache is unavailable.
+   * For mutex/lock patterns where you need to distinguish these cases, use { onError: 'throw' }.
+   */
+  async setIfNotExists<T>(
+    key: string,
+    value: T,
+    ttlSeconds?: number,
+    options?: CallOptions,
+  ): Promise<boolean> {
+    this.validateKey(key);
+    if (ttlSeconds !== undefined) {
+      this.validateTtl(ttlSeconds);
+    }
+    return this.executeCommand('setIfNotExists', false, options, async () => {
+      const serialized = this.serialize(value);
+      let result: string | null;
+      if (ttlSeconds) {
+        result = await this.redis!.set(key, serialized, 'EX', ttlSeconds, 'NX');
+      } else {
+        result = await this.redis!.set(key, serialized, 'NX');
+      }
+      return result === 'OK';
+    });
+  }
+
+  /**
+   * Get multiple values from cache in a single round trip (MGET)
+   *
+   * @param keys - Array of cache keys
+   * @param options - Per-call options
+   * @returns Array of values in same order as keys, null for missing keys
+   */
+  async getMany<T>(
+    keys: string[],
+    options?: CallOptions,
+  ): Promise<(T | null)[]> {
+    if (keys.length === 0) {
+      return [];
+    }
+    for (const key of keys) {
+      this.validateKey(key);
+    }
+    const defaultValue = keys.map(() => null) as (T | null)[];
+    return this.executeCommand('getMany', defaultValue, options, async () => {
+      const results = await this.redis!.mget(...keys);
+      return results.map((result) => {
+        if (result === null) {
+          return null;
+        }
+        try {
+          const parsed = JSON.parse(result);
+          return this.sanitizeParsedValue(parsed) as T;
+        } catch {
+          // Return raw string value if not valid JSON
+          return result as unknown as T;
+        }
+      });
+    });
+  }
+
+  /**
+   * Set multiple key-value pairs in cache (MSET)
+   * If ttlSeconds is provided, uses a pipeline to set EXPIRE on each key
+   *
+   * @param entries - Array of { key, value } pairs
+   * @param ttlSeconds - Time to live in seconds (optional, applies to all keys)
+   * @param options - Per-call options
+   * @returns true if all keys were set successfully
+   */
+  async setMany<T>(
+    entries: Array<{ key: string; value: T }>,
+    ttlSeconds?: number,
+    options?: CallOptions,
+  ): Promise<boolean> {
+    if (entries.length === 0) {
+      return true;
+    }
+    for (const entry of entries) {
+      this.validateKey(entry.key);
+    }
+    if (ttlSeconds !== undefined) {
+      this.validateTtl(ttlSeconds);
+    }
+    return this.executeCommand('setMany', false, options, async () => {
+      // Build key-value pairs for MSET
+      const args = entries.flatMap((entry) => [
+        entry.key,
+        this.serialize(entry.value),
+      ]);
+
+      if (ttlSeconds) {
+        // Use pipeline: MSET + EXPIRE for each key
+        const pipeline = this.redis!.pipeline();
+        pipeline.mset(...args);
+        for (const entry of entries) {
+          pipeline.expire(entry.key, ttlSeconds);
+        }
+        await pipeline.exec();
+      } else {
+        await this.redis!.mset(...args);
+      }
+      return true;
+    });
+  }
+
+  /**
+   * Update the TTL of an existing key without changing its value (EXPIRE)
+   *
+   * @param key - Cache key
+   * @param ttlSeconds - New time to live in seconds
+   * @param options - Per-call options
+   * @returns true if key exists and TTL was set, false if key doesn't exist
+   */
+  async expire(
+    key: string,
+    ttlSeconds: number,
+    options?: CallOptions,
+  ): Promise<boolean> {
+    this.validateKey(key);
+    this.validateTtl(ttlSeconds);
+    return this.executeCommand('expire', false, options, async () => {
+      const result = await this.redis!.expire(key, ttlSeconds);
+      return result === 1;
     });
   }
 
@@ -634,6 +779,13 @@ export class ResilientCacheClient implements ICacheClient {
     if (!Number.isFinite(value)) {
       throw new TypeError(`${name} must be a finite number`);
     }
+  }
+
+  /**
+   * Serialize a value for storage in Redis
+   */
+  private serialize<T>(value: T): string {
+    return typeof value === 'string' ? value : JSON.stringify(value);
   }
 
   /**

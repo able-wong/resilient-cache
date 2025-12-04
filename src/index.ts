@@ -13,6 +13,7 @@ export type {
   CallOptions,
   ConnectionState,
   ConnectionStatus,
+  GetOrSetOptions,
   ICacheClient,
   CacheKeyConfig,
 } from './types.js';
