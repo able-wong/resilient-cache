@@ -23,7 +23,9 @@ vi.mock('ioredis', () => {
   };
 
   return {
-    default: vi.fn(function () { return mockRedisInstance; }),
+    default: vi.fn(function () {
+      return mockRedisInstance;
+    }),
   };
 });
 
