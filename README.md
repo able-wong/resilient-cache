@@ -567,6 +567,20 @@ docker compose down
 
 ---
 
+## Changelog
+
+### 0.3.1
+- Security: patched high-severity vulnerabilities in `flatted`, `minimatch`, and `rollup`
+- Security: upgraded `vitest` from v2 to v4 (and related packages) to patch moderate esbuild vulnerability
+
+### 0.3.0
+- Added batch operations and distributed lock support
+
+### 0.2.0
+- Added manual `connect()` support to bypass cooldown
+
+---
+
 ## License
 
 Apache-2.0
