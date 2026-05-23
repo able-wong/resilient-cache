@@ -569,6 +569,9 @@ docker compose down
 
 ## Changelog
 
+### 0.3.2
+- Dependency maintenance: updated dev dependencies (`@babel/parser`, `@eslint-community/eslint-utils`, `@eslint/config-array`, `@emnapi/wasi-threads`, and others) to latest patch versions
+
 ### 0.3.1
 - Security: patched high-severity vulnerabilities in `flatted`, `minimatch`, and `rollup`
 - Security: upgraded `vitest` from v2 to v4 (and related packages) to patch moderate esbuild vulnerability
