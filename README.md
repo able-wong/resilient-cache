@@ -569,6 +569,9 @@ docker compose down
 
 ## Changelog
 
+### 0.3.3
+- Fix: publish pipeline falls back to `npm install` when `npm ci` fails due to lock file sync issues with optional platform-specific packages
+
 ### 0.3.2
 - Dependency maintenance: updated dev dependencies (`@babel/parser`, `@eslint-community/eslint-utils`, `@eslint/config-array`, `@emnapi/wasi-threads`, and others) to latest patch versions
 
