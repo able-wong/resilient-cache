@@ -662,6 +662,18 @@ npx vitest run --config vitest.integration.config.ts
 docker compose down
 ```
 
+**Port 6379 already in use?** `npm run test:integration` fails with
+`port is already allocated` if another Redis/Valkey (e.g. one for a different
+project) is listening on 6379. Rather than pointing the tests at that instance
+(they write and delete keys under a `test:<timestamp>` prefix), start a throwaway
+Redis on a free port and pass it via `REDIS_PORT` (`REDIS_HOST` is also supported):
+
+```bash
+docker run -d --rm --name resilient-cache-it -p 6390:6379 redis:7-alpine
+REDIS_PORT=6390 npx vitest run --config vitest.integration.config.ts
+docker stop resilient-cache-it
+```
+
 ### Code Style
 
 - ESLint + Prettier for formatting
