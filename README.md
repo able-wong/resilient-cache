@@ -27,7 +27,7 @@ Resilient Redis/Valkey cache client with graceful degradation, fast failure dete
 npm install resilient-cache
 ```
 
-**Requirements:** Node.js >= 20.0.0
+**Requirements:** Node.js >= 22.0.0
 
 ---
 
@@ -585,7 +585,7 @@ This is a simplified [circuit breaker pattern](https://martinfowler.com/bliki/Ci
 
 ### Prerequisites
 
-- Node.js >= 20.0.0
+- Node.js >= 22.0.0
 - Docker (for integration tests)
 
 ### Setup
@@ -696,6 +696,7 @@ docker stop resilient-cache-it
 ## Changelog
 
 ### 0.4.0
+- **Breaking:** requires Node.js >= 22.0.0 (Node 20 reached end of life in April 2026); CI now tests Node 22 and 24
 - Added `NullCacheClient`: implements `ICacheClient`, always misses, never throws its own errors
 - Added optional `logger` option (`CacheLogger`, pino/bunyan/console-compatible, `(context, message)` order). Logs connection-state changes and command errors; silent by default
 - Added optional `version` to `CacheKeyConfig` (string or number), placed just before the key suffix

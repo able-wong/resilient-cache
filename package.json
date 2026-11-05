@@ -37,7 +37,7 @@
   "author": "",
   "license": "Apache-2.0",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   },
   "dependencies": {
     "ioredis": "^5.4.1"
