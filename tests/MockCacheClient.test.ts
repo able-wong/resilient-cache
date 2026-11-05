@@ -21,6 +21,49 @@ describe('MockCacheClient', () => {
     });
   });
 
+  describe('get with isValid', () => {
+    it('should return the value when it passes', async () => {
+      await client.set('key', { v: 2 });
+      const isValid = vi.fn().mockReturnValue(true);
+      expect(await client.get('key', undefined, { isValid })).toEqual({ v: 2 });
+      expect(isValid).toHaveBeenCalledWith({ v: 2 });
+    });
+
+    it('should treat a failing value as a miss and return the default', async () => {
+      await client.set('key', { v: 1 });
+      expect(
+        await client.get('key', undefined, { isValid: () => false }),
+      ).toBeNull();
+      expect(
+        await client.get('key', { v: 0 }, { isValid: () => false }),
+      ).toEqual({ v: 0 });
+    });
+
+    it('should treat a throwing validator as a miss, even in throw mode', async () => {
+      await client.set('key', { v: 1 });
+      const isValid = () => {
+        throw new Error('bad shape');
+      };
+      await expect(
+        client.get('key', undefined, { isValid, onError: 'throw' }),
+      ).resolves.toBeNull();
+    });
+
+    it('should support an async validator', async () => {
+      await client.set('key', { v: 1 });
+      const isValid = vi.fn().mockResolvedValue(false);
+      expect(await client.get('key', undefined, { isValid })).toBeNull();
+    });
+
+    it('should not call the validator on a miss', async () => {
+      const isValid = vi.fn().mockReturnValue(true);
+      expect(await client.get('missing', 'default', { isValid })).toBe(
+        'default',
+      );
+      expect(isValid).not.toHaveBeenCalled();
+    });
+  });
+
   describe('get/set', () => {
     it('should store and retrieve values', async () => {
       await client.set('key1', 'value1');
@@ -429,6 +472,19 @@ describe('MockCacheClient', () => {
       expect(factory).toHaveBeenCalledOnce();
       // Verify cache was updated
       expect(await client.get('key')).toEqual({ version: 2, data: 'new' });
+    });
+
+    it('should treat a throwing isValid as stale and refetch', async () => {
+      await client.set('key', { version: 1 });
+      const factory = vi.fn().mockResolvedValue({ version: 2 });
+      const isValid = () => {
+        throw new Error('bad shape');
+      };
+
+      const result = await client.getOrSet('key', factory, 60, { isValid });
+
+      expect(result).toEqual({ version: 2 });
+      expect(await client.get('key')).toEqual({ version: 2 });
     });
 
     it('should support async isValid validator', async () => {

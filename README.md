@@ -15,6 +15,10 @@ Resilient Redis/Valkey cache client with graceful degradation, fast failure dete
 - **Configurable error handling**: Graceful (default) or throw exceptions
 - **Await-friendly API**: Modern async/await interface
 - **Replaceable**: Provider pattern for swapping implementations
+- **Opt-in logging**: Pass any pino/bunyan/console-compatible logger; silent by default
+- **Versioned keys**: Bump a key version to make old-shape cached values miss
+- **Value validation**: `isValid` on `get()` / `getOrSet()` turns a wrong-shape value into a miss
+- **No-cache mode**: `NullCacheClient` for running without Redis/Valkey
 - **TypeScript**: Full type safety with comprehensive type definitions
 
 ## Installation
@@ -23,7 +27,7 @@ Resilient Redis/Valkey cache client with graceful degradation, fast failure dete
 npm install resilient-cache
 ```
 
-**Requirements:** Node.js >= 20.0.0
+**Requirements:** Node.js >= 22.0.0
 
 ---
 
@@ -82,8 +86,50 @@ const prompts = await client.getOrSet(
     isValid: (cached) => cached.version >= requiredVersion
   }
 );
-// If isValid returns false, factory is called and cache is updated
+// If isValid returns false (or throws), factory is called and cache is updated
 ```
+
+### Validating Cached Values with get()
+
+```typescript
+// A value that fails isValid is a miss: you get defaultValue (or null), never an error
+const tree = await client.get<ProvisionTree>(key, undefined, {
+  isValid: (value) => Array.isArray(value?.children),
+});
+```
+
+`isValid` runs only when a value is found, may be async, and runs outside the
+command timeout. A validator that throws is treated as a miss.
+
+### Versioned Cache Keys
+
+When the shape of a cached value changes, old entries written by the previous
+deploy can still be read until they expire. Give the key config a `version` and
+change it when the shape changes: the new keys miss, the old entries are never
+read again and expire on their TTL.
+
+```typescript
+const keys = new CacheKeyBuilder({ app: 'myapp', env: 'production', version: 2 });
+
+keys.forTenant('legal').key('prompts');
+// => "app:myapp:env:production:tenant:legal:v:2:prompts"
+
+// Or without a builder (pure function)
+buildCacheKey({ app: 'myapp', env: 'production', version: 2 }, 'prompts', {
+  tenant: 'legal',
+});
+// => same key
+```
+
+- The version goes just before the suffix. `build()` and `toPattern()` leave it
+  out, so `removeByPrefix(keys.forTenant('legal').toPattern())` clears every version.
+- A number or a string; letters, digits, `.`, `_` and `-` only. Anything else throws `TypeError`.
+- Without a `version`, keys are exactly as before.
+
+**Choosing a version:** a per-feature constant in code, bumped in the same
+change that alters the value shape, invalidates only that feature. A commit SHA
+is automatic, but empties the cache for everything on every deploy. Either way,
+always set a TTL so entries under old versions are cleaned up.
 
 ### Batch Operations
 
@@ -223,6 +269,58 @@ client.onStateChange((status) => {
 });
 ```
 
+### Logging
+
+The client is silent by default. Pass a `logger` to receive connection-state
+changes and command errors. Methods are called in pino/bunyan order,
+`(context, message)`, so a pino instance or `console` can be passed directly.
+
+```typescript
+import pino from 'pino';
+
+const client = new ResilientCacheClient({
+  host: 'localhost',
+  port: 6379,
+  logger: pino(),
+});
+```
+
+| Event | Level | Context |
+|-------|-------|---------|
+| `connecting` / `reconnecting` | `debug` | `host`, `port` |
+| `connected` / `disconnected` | `info` | `host`, `port` |
+| `cooldown` | `warn` | `host`, `port`, `cooldownEndsAt`, `error` |
+| `failed` (max reconnect attempts reached) | `error` | `host`, `port`, `reconnectAttempts`, `error` |
+| Command error that is not a connection error (e.g. timeout) | `warn` | `operation`, `error` |
+
+The password and cache keys are never logged. A logger that throws is ignored.
+
+If your logger takes `(message, context)` instead, adapt it:
+
+```typescript
+const logger = {
+  debug: (ctx, msg) => myLogger.debug(msg, ctx),
+  info: (ctx, msg) => myLogger.info(msg, ctx),
+  warn: (ctx, msg) => myLogger.warn(msg, ctx),
+  error: (ctx, msg) => myLogger.error(msg, ctx),
+};
+```
+
+### Running Without a Cache (NullCacheClient)
+
+`NullCacheClient` implements `ICacheClient` with no backing store: every read
+misses, every write returns its failure value, and `getOrSet()` always calls the
+factory. It never throws its own errors, even with `{ onError: 'throw' }`.
+Return values match `ResilientCacheClient` in graceful mode when the cache is down.
+
+```typescript
+import { NullCacheClient, ResilientCacheClient, type ICacheClient } from 'resilient-cache';
+
+const cache: ICacheClient = process.env.VALKEY_HOST
+  ? new ResilientCacheClient({ host: process.env.VALKEY_HOST, port: 6379 })
+  : new NullCacheClient();
+```
+
 ### Testing with MockCacheClient
 
 ```typescript
@@ -280,6 +378,7 @@ const client = new ResilientCacheClient({
   enableOfflineQueue?: boolean;  // Queue commands when disconnected (default: false)
   onError?: 'graceful' | 'throw'; // Error handling mode (default: 'graceful')
   autoConnect?: boolean;     // Auto-connect on first command (default: true)
+  logger?: CacheLogger;      // Optional logger, (context, message) order (default: none)
 });
 ```
 
@@ -308,8 +407,8 @@ const client = new ResilientCacheClient({
 | `setMany<T>(entries, ttlSeconds?, options?)` | `false` | throws `CacheUnavailableError` |
 | `expire(key, ttlSeconds, options?)` | `false` | throws `CacheUnavailableError` |
 
-**`getOrSet` options:**
-- `isValid?: (value: T) => boolean | Promise<boolean>` - Optional validator called when cache hits. Return `false` to treat value as stale (triggers factory call and cache update).
+**`get` / `getOrSet` options:**
+- `isValid?: (value: T) => boolean | Promise<boolean>` - Optional validator called when a value is found. Returning `false` or throwing makes it a miss: `get` returns `defaultValue ?? null`, `getOrSet` calls the factory and updates the cache.
 
 **`setIfNotExists` note:**
 - In graceful mode, returns `false` both when key exists AND when cache is unavailable. For mutex/lock patterns, use `{ onError: 'throw' }` to distinguish these cases.
@@ -317,15 +416,28 @@ const client = new ResilientCacheClient({
 ### CacheKeyBuilder
 
 ```typescript
-const keys = new CacheKeyBuilder({ app: 'myapp', env: 'production' });
+const keys = new CacheKeyBuilder({
+  app: 'myapp',
+  env: 'production',
+  version: 2,                      // Optional, see Versioned Cache Keys
+});
 
 keys.forTenant('legal');           // Add tenant scope
 keys.forOrg('org123');             // Add org scope
 keys.forUser('user456');           // Add user scope
 keys.build();                      // Get prefix string
-keys.key('suffix');                // Get full key with suffix
-keys.toPattern();                  // Get pattern for removeByPrefix
+keys.key('suffix');                // Get full key with version (if set) and suffix
+keys.toPattern();                  // Get pattern for removeByPrefix (all versions)
 keys.clone();                      // Create independent copy
+
+// Pure function, no builder instance
+buildCacheKey(config, 'suffix', { tenant?, org?, user? });
+```
+
+### NullCacheClient
+
+```typescript
+const cache: ICacheClient = new NullCacheClient(); // always misses, never throws
 ```
 
 ### CacheProvider
@@ -473,7 +585,7 @@ This is a simplified [circuit breaker pattern](https://martinfowler.com/bliki/Ci
 
 ### Prerequisites
 
-- Node.js >= 20.0.0
+- Node.js >= 22.0.0
 - Docker (for integration tests)
 
 ### Setup
@@ -509,8 +621,10 @@ resilient-cache/
 │   ├── types.ts                 # Type definitions
 │   ├── errors.ts                # Custom error classes
 │   ├── ResilientCacheClient.ts  # Main client implementation
-│   ├── CacheKeyBuilder.ts       # Key prefix utility
+│   ├── CacheKeyBuilder.ts       # Key builder + buildCacheKey
 │   ├── CacheProvider.ts         # Factory/DI pattern
+│   ├── NullCacheClient.ts       # No-op client (always misses)
+│   ├── validateCachedValue.ts   # Shared isValid handling
 │   └── MockCacheClient.ts       # In-memory mock for testing
 ├── tests/
 │   ├── *.test.ts                # Unit tests
@@ -548,6 +662,18 @@ npx vitest run --config vitest.integration.config.ts
 docker compose down
 ```
 
+**Port 6379 already in use?** `npm run test:integration` fails with
+`port is already allocated` if another Redis/Valkey (e.g. one for a different
+project) is listening on 6379. Rather than pointing the tests at that instance
+(they write and delete keys under a `test:<timestamp>` prefix), start a throwaway
+Redis on a free port and pass it via `REDIS_PORT` (`REDIS_HOST` is also supported):
+
+```bash
+docker run -d --rm --name resilient-cache-it -p 6390:6379 redis:7-alpine
+REDIS_PORT=6390 npx vitest run --config vitest.integration.config.ts
+docker stop resilient-cache-it
+```
+
 ### Code Style
 
 - ESLint + Prettier for formatting
@@ -568,6 +694,17 @@ docker compose down
 ---
 
 ## Changelog
+
+### 0.4.0
+- **Breaking:** requires Node.js >= 22.0.0 (Node 20 reached end of life in April 2026); CI now tests Node 22 and 24
+- Added `NullCacheClient`: implements `ICacheClient`, always misses, never throws its own errors
+- Added optional `logger` option (`CacheLogger`, pino/bunyan/console-compatible, `(context, message)` order). Logs connection-state changes and command errors; silent by default
+- Added optional `version` to `CacheKeyConfig` (string or number), placed just before the key suffix
+- Added `buildCacheKey(config, suffix, scope?)`, a pure key-building function
+- Added `isValid` option to `get()` (`GetOptions`): a value that fails it is a miss
+- Changed: an `isValid` validator that throws in `getOrSet()` is now treated as stale (factory runs) instead of propagating the error
+- Fixed: `onStateChange` callbacks now receive `cooldownEndsAt` when entering cooldown
+- Dependency maintenance: `ioredis` 5.10.1 → 5.11.1; dev dependencies updated within their ranges, fixing all high-severity `npm audit` findings (vite, postcss, tmp, brace-expansion, js-yaml, nanoid, source-map-js)
 
 ### 0.3.3
 - Fix: publish pipeline falls back to `npm install` when `npm ci` fails due to lock file sync issues with optional platform-specific packages

@@ -1,4 +1,25 @@
 /**
+ * A log method in pino/bunyan argument order: context object first, then message.
+ */
+export type CacheLogFn = (
+  context: Record<string, unknown>,
+  message: string,
+) => void;
+
+/**
+ * Minimal logger interface accepted by ResilientCacheClient.
+ *
+ * Structurally compatible with pino and bunyan instances, and with `console`.
+ * The library has no logging dependency; pass any object with these methods.
+ */
+export interface CacheLogger {
+  debug: CacheLogFn;
+  info: CacheLogFn;
+  warn: CacheLogFn;
+  error: CacheLogFn;
+}
+
+/**
  * Configuration options for the ResilientCacheClient
  */
 export interface CacheClientOptions {
@@ -39,6 +60,12 @@ export interface CacheClientOptions {
    * When false, you must call connect() explicitly before issuing commands.
    */
   autoConnect?: boolean;
+
+  /**
+   * Optional logger for connection-state changes and command errors (default: none, silent).
+   * Never receives the password or cache keys.
+   */
+  logger?: CacheLogger;
 }
 
 /**
@@ -50,17 +77,25 @@ export interface CallOptions {
 }
 
 /**
- * Options for getOrSet method
+ * Options for get method
  */
-export interface GetOrSetOptions<T> extends CallOptions {
+export interface GetOptions<T> extends CallOptions {
   /**
-   * Optional validator to check if a cached value is still valid/fresh.
-   * Called when a cached value is found.
-   * Return false to treat the cached value as stale (will call factory and update cache).
+   * Optional validator for a cached value (e.g. a shape or freshness check).
+   * Called only when a value is found, never on a miss.
+   * Return false, or throw, to treat the value as a miss.
    * Return true to use the cached value as-is.
    */
   isValid?: (value: T) => boolean | Promise<boolean>;
 }
+
+/**
+ * Options for getOrSet method
+ *
+ * `isValid` works as in `get`: a value that fails it (or a validator that throws)
+ * is a miss, so the factory runs and the cache is updated.
+ */
+export type GetOrSetOptions<T> = GetOptions<T>;
 
 /**
  * Connection state of the cache client
@@ -117,13 +152,14 @@ export interface ICacheClient {
   /**
    * Get a value from cache
    * @param key - Cache key
-   * @param defaultValue - Optional default value if key doesn't exist or cache unavailable
-   * @param options - Per-call options
+   * @param defaultValue - Optional default value if key doesn't exist, cache unavailable,
+   *   or the value fails `options.isValid`
+   * @param options - Per-call options, including an optional isValid validator
    */
   get<T>(
     key: string,
     defaultValue?: T,
-    options?: CallOptions,
+    options?: GetOptions<T>,
   ): Promise<T | null>;
 
   /**
@@ -310,4 +346,16 @@ export interface CacheKeyConfig {
 
   /** Environment (e.g., 'production', 'staging') */
   env: string;
+
+  /**
+   * Optional key version, added to every key as `v:<version>` just before the suffix.
+   * Change it when the shape of the cached values changes: keys built with the
+   * new version miss, and entries under the old version expire on their TTL.
+   *
+   * A number (e.g. `2`) or a string (e.g. a short commit SHA). Allowed characters:
+   * letters, digits, `.`, `_` and `-`.
+   *
+   * Not included in `build()` / `toPattern()`, so prefix removal matches all versions.
+   */
+  version?: string | number;
 }

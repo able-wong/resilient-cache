@@ -1,16 +1,20 @@
 import Redis from 'ioredis';
 import type {
   CacheClientOptions,
+  CacheLogger,
   CallOptions,
   ConnectionState,
   ConnectionStatus,
+  GetOptions,
   GetOrSetOptions,
   ICacheClient,
 } from './types.js';
 import { CacheUnavailableError, CacheTimeoutError } from './errors.js';
+import { passesValidator } from './validateCachedValue.js';
 
 type StateChangeCallback = (status: ConnectionStatus) => void;
 type ErrorCallback = (error: Error) => void;
+type LogLevel = keyof CacheLogger;
 
 /** Maximum allowed cache key length */
 const MAX_KEY_LENGTH = 512;
@@ -102,7 +106,10 @@ export class ResilientCacheClient implements ICacheClient {
     autoConnect: boolean;
   };
 
+  private readonly logger: CacheLogger | undefined;
+
   constructor(options: CacheClientOptions) {
+    this.logger = options.logger;
     this.options = {
       host: options.host,
       port: options.port,
@@ -232,31 +239,40 @@ export class ResilientCacheClient implements ICacheClient {
 
   /**
    * Get a value from cache
+   * A value that fails options.isValid (or whose validator throws) is a miss.
    */
   async get<T>(
     key: string,
     defaultValue?: T,
-    options?: CallOptions,
+    options?: GetOptions<T>,
   ): Promise<T | null> {
     this.validateKey(key);
-    return this.executeCommand(
-      'get',
-      defaultValue ?? null,
-      options,
-      async () => {
-        const result = await this.redis!.get(key);
-        if (result === null) {
-          return defaultValue ?? null;
-        }
-        try {
-          const parsed = JSON.parse(result);
-          return this.sanitizeParsedValue(parsed) as T;
-        } catch {
-          // Return raw string value if not valid JSON
-          return result as unknown as T;
-        }
-      },
-    );
+    const fallback = defaultValue ?? null;
+    const read = await this.executeCommand<
+      { found: false } | { found: true; value: T }
+    >('get', { found: false }, options, async () => {
+      const result = await this.redis!.get(key);
+      if (result === null) {
+        return { found: false };
+      }
+      try {
+        const parsed = JSON.parse(result);
+        return { found: true, value: this.sanitizeParsedValue(parsed) as T };
+      } catch {
+        // Return raw string value if not valid JSON
+        return { found: true, value: result as unknown as T };
+      }
+    });
+
+    if (!read.found) {
+      return fallback;
+    }
+    // Validated outside executeCommand so a slow validator does not count
+    // against commandTimeout and is never reported as a cache failure.
+    if (!(await passesValidator(read.value, options?.isValid))) {
+      return fallback;
+    }
+    return read.value;
   }
 
   /**
@@ -420,23 +436,17 @@ export class ResilientCacheClient implements ICacheClient {
       this.validateTtl(ttlSeconds);
     }
 
-    // Try to get from cache first (always graceful - cache failure = cache miss)
-    const cached = await this.get<T>(key, undefined, { onError: 'graceful' });
+    // Try to get from cache first (always graceful - cache failure = cache miss).
+    // get() applies isValid, so a stale value comes back as a miss.
+    const cached = await this.get<T>(key, undefined, {
+      onError: 'graceful',
+      isValid: options?.isValid,
+    });
     if (cached !== null) {
-      // If validator provided, check if cached value is still valid
-      if (options?.isValid) {
-        const isValid = await options.isValid(cached);
-        if (!isValid) {
-          // Cached value is stale - fetch fresh value
-          const value = await factory();
-          await this.set(key, value, ttlSeconds, { onError: 'graceful' });
-          return value;
-        }
-      }
       return cached;
     }
 
-    // Cache miss or unavailable - call factory
+    // Cache miss, stale value, or unavailable - call factory
     const value = await factory();
 
     // Try to cache the result (best effort, always graceful)
@@ -853,10 +863,17 @@ export class ResilientCacheClient implements ICacheClient {
   /**
    * Handle command error
    */
-  private handleCommandError(error: Error, _operation: string): void {
+  private handleCommandError(error: Error, operation: string): void {
     if (this.isConnectionError(error)) {
+      // Logged by the resulting state change (cooldown / failed)
       this.handleConnectionFailure(error);
+      return;
     }
+    this.log(
+      'warn',
+      { operation, error: error.message },
+      'Cache command failed',
+    );
   }
 
   /**
@@ -889,8 +906,9 @@ export class ResilientCacheClient implements ICacheClient {
    * Next command after cooldown expires will trigger reconnect
    */
   private enterCooldown(): void {
-    this.setState('cooldown');
+    // Set before setState so onStateChange callbacks and the log see cooldownEndsAt
     this.cooldownEndsAt = new Date(Date.now() + this.options.reconnectDelay);
+    this.setState('cooldown');
   }
 
   /**
@@ -930,6 +948,7 @@ export class ResilientCacheClient implements ICacheClient {
     if (this.state === newState) return;
 
     this.state = newState;
+    this.logStateChange(newState);
 
     const status = this.getStatus();
     for (const callback of this.stateChangeCallbacks) {
@@ -938,6 +957,67 @@ export class ResilientCacheClient implements ICacheClient {
       } catch {
         // Ignore callback errors
       }
+    }
+  }
+
+  /**
+   * Log a connection-state change at the level that matches its severity.
+   * Context never includes the password.
+   */
+  private logStateChange(state: ConnectionState): void {
+    const server = { host: this.options.host, port: this.options.port };
+    switch (state) {
+      case 'connected':
+        this.log('info', server, 'Cache connected');
+        break;
+      case 'disconnected':
+        this.log('info', server, 'Cache disconnected');
+        break;
+      case 'connecting':
+        this.log('debug', server, 'Cache connecting');
+        break;
+      case 'reconnecting':
+        this.log('debug', server, 'Cache reconnecting');
+        break;
+      case 'cooldown':
+        this.log(
+          'warn',
+          {
+            ...server,
+            cooldownEndsAt: this.cooldownEndsAt?.toISOString(),
+            error: this.lastError?.message,
+          },
+          'Cache unavailable, entering cooldown',
+        );
+        break;
+      case 'failed':
+        this.log(
+          'error',
+          {
+            ...server,
+            reconnectAttempts: this.reconnectAttempts,
+            error: this.lastError?.message,
+          },
+          'Cache reconnect attempts exhausted',
+        );
+        break;
+    }
+  }
+
+  /**
+   * Send a log entry to the optional logger.
+   * A logger that throws must never affect cache behaviour.
+   */
+  private log(
+    level: LogLevel,
+    context: Record<string, unknown>,
+    message: string,
+  ): void {
+    if (!this.logger) return;
+    try {
+      this.logger[level](context, message);
+    } catch {
+      // Ignore logger errors
     }
   }
 }

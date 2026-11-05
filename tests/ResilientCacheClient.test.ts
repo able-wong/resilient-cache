@@ -137,6 +137,86 @@ describe('ResilientCacheClient', () => {
     });
   });
 
+  describe('get with isValid', () => {
+    const mockStoredValue = async (value: unknown) => {
+      const Redis = (await import('ioredis')).default;
+      const mockInstance = new Redis();
+      (mockInstance.get as ReturnType<typeof vi.fn>).mockResolvedValue(
+        value === null ? null : JSON.stringify(value),
+      );
+      await client.connect();
+    };
+
+    it('should return the value when it passes', async () => {
+      await mockStoredValue({ v: 2 });
+      const isValid = vi.fn().mockReturnValue(true);
+      expect(await client.get('key', undefined, { isValid })).toEqual({ v: 2 });
+      expect(isValid).toHaveBeenCalledWith({ v: 2 });
+    });
+
+    it('should treat a failing value as a miss', async () => {
+      await mockStoredValue({ v: 1 });
+      const isValid = () => false;
+      expect(await client.get('key', undefined, { isValid })).toBeNull();
+    });
+
+    it('should return the default value when the value fails', async () => {
+      await mockStoredValue({ v: 1 });
+      expect(
+        await client.get('key', { v: 0 }, { isValid: () => false }),
+      ).toEqual({ v: 0 });
+    });
+
+    it('should treat a throwing validator as a miss, even in throw mode', async () => {
+      await mockStoredValue({ v: 1 });
+      const isValid = () => {
+        throw new Error('bad shape');
+      };
+      await expect(
+        client.get('key', undefined, { isValid, onError: 'throw' }),
+      ).resolves.toBeNull();
+    });
+
+    it('should support an async validator', async () => {
+      await mockStoredValue({ v: 1 });
+      const isValid = vi.fn().mockResolvedValue(false);
+      expect(await client.get('key', undefined, { isValid })).toBeNull();
+    });
+
+    it('should not call the validator on a miss', async () => {
+      await mockStoredValue(null);
+      const isValid = vi.fn().mockReturnValue(true);
+      expect(await client.get('key', 'default', { isValid })).toBe('default');
+      expect(isValid).not.toHaveBeenCalled();
+    });
+
+    it('should not call the validator when the cache is unavailable', async () => {
+      const noAutoClient = new ResilientCacheClient({
+        ...defaultOptions,
+        autoConnect: false,
+      });
+      const isValid = vi.fn().mockReturnValue(true);
+      expect(await noAutoClient.get('key', 'default', { isValid })).toBe(
+        'default',
+      );
+      expect(isValid).not.toHaveBeenCalled();
+    });
+
+    it('should not count a slow validator against commandTimeout', async () => {
+      await mockStoredValue({ v: 1 });
+      const isValid = () =>
+        new Promise<boolean>((resolve) =>
+          setTimeout(() => resolve(true), 5000),
+        );
+      const pending = client.get('key', undefined, {
+        isValid,
+        onError: 'throw',
+      });
+      await vi.advanceTimersByTimeAsync(5000);
+      await expect(pending).resolves.toEqual({ v: 1 });
+    });
+  });
+
   describe('set', () => {
     it('should return true on success', async () => {
       await client.connect();
@@ -252,6 +332,183 @@ describe('ResilientCacheClient', () => {
       client.onError(callback);
       // Callback is registered but not called without errors
       expect(callback).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('logger', () => {
+    const createLogger = () => ({
+      debug: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    });
+
+    const connectionRefused = () =>
+      Object.assign(new Error('connect ECONNREFUSED'), {
+        code: 'ECONNREFUSED',
+      });
+
+    const getMockRedis = async () => {
+      const Redis = (await import('ioredis')).default;
+      return new Redis() as unknown as Record<string, ReturnType<typeof vi.fn>>;
+    };
+
+    const allLoggedContexts = (logger: ReturnType<typeof createLogger>) =>
+      Object.values(logger).flatMap((fn) =>
+        fn.mock.calls.map((call) => JSON.stringify(call)),
+      );
+
+    it('should log connecting at debug and connected at info', async () => {
+      const logger = createLogger();
+      const logged = new ResilientCacheClient({ ...defaultOptions, logger });
+
+      await logged.connect();
+
+      expect(logger.debug).toHaveBeenCalledWith(
+        { host: 'localhost', port: 6379 },
+        'Cache connecting',
+      );
+      expect(logger.info).toHaveBeenCalledWith(
+        { host: 'localhost', port: 6379 },
+        'Cache connected',
+      );
+      await logged.disconnect();
+    });
+
+    it('should log disconnected at info', async () => {
+      const logger = createLogger();
+      const logged = new ResilientCacheClient({ ...defaultOptions, logger });
+
+      await logged.connect();
+      await logged.disconnect();
+
+      expect(logger.info).toHaveBeenCalledWith(
+        { host: 'localhost', port: 6379 },
+        'Cache disconnected',
+      );
+    });
+
+    it('should log cooldown at warn with cooldownEndsAt and the error', async () => {
+      const logger = createLogger();
+      const logged = new ResilientCacheClient({ ...defaultOptions, logger });
+      const redis = await getMockRedis();
+      redis.connect.mockRejectedValueOnce(connectionRefused());
+
+      await expect(logged.connect()).rejects.toThrow();
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          host: 'localhost',
+          port: 6379,
+          cooldownEndsAt: expect.any(String),
+          error: 'connect ECONNREFUSED',
+        }),
+        'Cache unavailable, entering cooldown',
+      );
+      await logged.disconnect();
+    });
+
+    it('should log failed at error when reconnect attempts are exhausted', async () => {
+      const logger = createLogger();
+      const logged = new ResilientCacheClient({
+        ...defaultOptions,
+        logger,
+        maxReconnectAttempts: 1,
+      });
+      const redis = await getMockRedis();
+      redis.connect.mockRejectedValueOnce(connectionRefused());
+
+      await expect(logged.connect()).rejects.toThrow();
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reconnectAttempts: 1,
+          error: 'connect ECONNREFUSED',
+        }),
+        'Cache reconnect attempts exhausted',
+      );
+      await logged.disconnect();
+    });
+
+    it('should log a command timeout at warn with the operation', async () => {
+      const logger = createLogger();
+      const logged = new ResilientCacheClient({ ...defaultOptions, logger });
+      const redis = await getMockRedis();
+      await logged.connect();
+      redis.get.mockImplementationOnce(() => new Promise(() => {}));
+
+      const pending = logged.get('key');
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(await pending).toBeNull();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ operation: 'get' }),
+        'Cache command failed',
+      );
+      await logged.disconnect();
+    });
+
+    it('should never log the password or cache keys', async () => {
+      const logger = createLogger();
+      const logged = new ResilientCacheClient({
+        ...defaultOptions,
+        password: 's3cret-pass',
+        logger,
+      });
+      const redis = await getMockRedis();
+      await logged.connect();
+      redis.get.mockImplementationOnce(() => new Promise(() => {}));
+      const pending = logged.get('app:x:user:secret-user-id:profile');
+      await vi.advanceTimersByTimeAsync(500);
+      await pending;
+      await logged.disconnect();
+
+      const contexts = allLoggedContexts(logger);
+      expect(contexts.length).toBeGreaterThan(0);
+      for (const entry of contexts) {
+        expect(entry).not.toContain('s3cret-pass');
+        expect(entry).not.toContain('secret-user-id');
+      }
+    });
+
+    it('should ignore a logger that throws', async () => {
+      const throwing = () => {
+        throw new Error('logger broke');
+      };
+      const logged = new ResilientCacheClient({
+        ...defaultOptions,
+        logger: {
+          debug: throwing,
+          info: throwing,
+          warn: throwing,
+          error: throwing,
+        },
+      });
+
+      await expect(logged.connect()).resolves.toBeUndefined();
+      expect(logged.getStatus().state).toBe('connected');
+      await logged.disconnect();
+    });
+
+    it('should be silent and work normally without a logger', async () => {
+      await expect(client.connect()).resolves.toBeUndefined();
+      expect(client.getStatus().state).toBe('connected');
+    });
+
+    it('should give onStateChange callbacks cooldownEndsAt during cooldown', async () => {
+      const callback = vi.fn();
+      client.onStateChange(callback);
+      const redis = await getMockRedis();
+      redis.connect.mockRejectedValueOnce(connectionRefused());
+
+      await expect(client.connect()).rejects.toThrow();
+
+      expect(callback).toHaveBeenCalledWith(
+        expect.objectContaining({
+          state: 'cooldown',
+          cooldownEndsAt: expect.any(Date),
+        }),
+      );
     });
   });
 
@@ -388,6 +645,48 @@ describe('ResilientCacheClient', () => {
       expect(result).toBe('new-value');
       expect(factory).toHaveBeenCalledOnce();
       expect(mockInstance.set).toHaveBeenCalled();
+    });
+
+    it('should refetch and re-set when isValid returns false', async () => {
+      const Redis = (await import('ioredis')).default;
+      const mockInstance = new Redis();
+      (mockInstance.get as ReturnType<typeof vi.fn>).mockResolvedValue(
+        JSON.stringify({ v: 1 }),
+      );
+
+      await client.connect();
+      const factory = vi.fn().mockResolvedValue({ v: 2 });
+      const result = await client.getOrSet('key', factory, 60, {
+        isValid: () => false,
+      });
+
+      expect(result).toEqual({ v: 2 });
+      expect(factory).toHaveBeenCalledOnce();
+      expect(mockInstance.set).toHaveBeenCalledWith(
+        'key',
+        JSON.stringify({ v: 2 }),
+        'EX',
+        60,
+      );
+    });
+
+    it('should treat a throwing isValid as stale', async () => {
+      const Redis = (await import('ioredis')).default;
+      const mockInstance = new Redis();
+      (mockInstance.get as ReturnType<typeof vi.fn>).mockResolvedValue(
+        JSON.stringify({ v: 1 }),
+      );
+
+      await client.connect();
+      const factory = vi.fn().mockResolvedValue({ v: 2 });
+      const result = await client.getOrSet('key', factory, 60, {
+        isValid: () => {
+          throw new Error('bad shape');
+        },
+      });
+
+      expect(result).toEqual({ v: 2 });
+      expect(factory).toHaveBeenCalledOnce();
     });
 
     it('should call factory when not connected (autoConnect disabled)', async () => {
