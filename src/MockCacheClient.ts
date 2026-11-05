@@ -1,5 +1,11 @@
-import type { ICacheClient, CallOptions, GetOrSetOptions } from './types.js';
+import type {
+  ICacheClient,
+  CallOptions,
+  GetOptions,
+  GetOrSetOptions,
+} from './types.js';
 import { CacheUnavailableError } from './errors.js';
+import { passesValidator } from './validateCachedValue.js';
 
 /**
  * Error thrown when a Redis command is executed against a key holding the wrong type
@@ -120,18 +126,25 @@ export class MockCacheClient implements ICacheClient {
   async get<T>(
     key: string,
     defaultValue?: T,
-    options?: CallOptions,
+    options?: GetOptions<T>,
   ): Promise<T | null> {
+    const fallback = defaultValue ?? null;
     if (this.simulateFailure) {
-      return this.handleError('get', defaultValue ?? null, options);
+      return this.handleError('get', fallback, options);
     }
 
     if (this.isExpired(key)) {
-      return defaultValue ?? null;
+      return fallback;
     }
 
-    const item = this.store.get(key);
-    return (item?.value as T) ?? defaultValue ?? null;
+    const value = this.store.get(key)?.value as T | undefined;
+    if (value === undefined || value === null) {
+      return fallback;
+    }
+    if (!(await passesValidator(value, options?.isValid))) {
+      return fallback;
+    }
+    return value;
   }
 
   async set<T>(
@@ -260,31 +273,17 @@ export class MockCacheClient implements ICacheClient {
     ttlSeconds?: number,
     options?: GetOrSetOptions<T>,
   ): Promise<T> {
-    // Try to get from cache first (always graceful - cache failure = cache miss)
-    const cached = await this.get<T>(key, undefined, { onError: 'graceful' });
+    // Try to get from cache first (always graceful - cache failure = cache miss).
+    // get() applies isValid, so a stale value comes back as a miss.
+    const cached = await this.get<T>(key, undefined, {
+      onError: 'graceful',
+      isValid: options?.isValid,
+    });
     if (cached !== null) {
-      // If validator provided, check if cached value is still valid
-      if (options?.isValid) {
-        const isValid = await options.isValid(cached);
-        if (!isValid) {
-          // Cached value is stale - fetch fresh value
-          const value = await factory();
-          if (!this.simulateFailure) {
-            const storedValue: StoredValue = {
-              value,
-              expiresAt: ttlSeconds
-                ? Date.now() + ttlSeconds * 1000
-                : undefined,
-            };
-            this.store.set(key, storedValue);
-          }
-          return value;
-        }
-      }
       return cached;
     }
 
-    // Cache miss or unavailable - call factory
+    // Cache miss, stale value, or unavailable - call factory
     const value = await factory();
 
     // Try to cache the result (best effort)
